@@ -46,29 +46,38 @@ public class JanusDCRProvider implements ClientRegistrationProvider {
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, true);
 
     private final KeycloakSession session;
+    private ClientRegistrationAuth auth;
+    private EventBuilder event;
 
     public JanusDCRProvider(KeycloakSession session) {
         this.session = session;
     }
 
-    // ─── Setters required by the SPI (Keycloak calls these before create) ──
+    // ─── Setters/getters required by the SPI ─────────────────────────────
 
     @Override
     public void setAuth(ClientRegistrationAuth auth) {
         // JANUS uses anonymous registration (public endpoint). Initial access
         // tokens are not required but are supported if Keycloak is configured to
-        // enforce them for this realm.
+        // enforce them for this realm. Stored for SPI contract compliance.
+        this.auth = auth;
+    }
+
+    @Override
+    public ClientRegistrationAuth getAuth() {
+        return auth;
     }
 
     @Override
     public void setEvent(EventBuilder event) {
-        // No Keycloak event recording needed for JANUS registrations.
+        // Stored for SPI contract compliance; JANUS does not record Keycloak
+        // events for registrations.
+        this.event = event;
     }
 
     @Override
-    public void setKeycloakSession(KeycloakSession session) {
-        // Session is provided via the constructor; this setter exists for SPI
-        // compatibility with older versions of Keycloak that call it directly.
+    public EventBuilder getEvent() {
+        return event;
     }
 
     // ─── DCR endpoint ─────────────────────────────────────────────────────
@@ -84,7 +93,6 @@ public class JanusDCRProvider implements ClientRegistrationProvider {
      *   <li>Return the Entra {@code appId} in the DCR response.</li>
      * </ol>
      */
-    @Override
     public Response create(UriInfo uriInfo, InputStream inputStream) {
         String correlationId = UUID.randomUUID().toString();
         RealmModel realm = session.getContext().getRealm();
@@ -143,7 +151,6 @@ public class JanusDCRProvider implements ClientRegistrationProvider {
      * GET /realms/{realm}/clients-registrations/openid-connect/{clientId}
      * Not supported by JANUS.
      */
-    @Override
     public Response get(ClientModel client) {
         return Response.status(501)
                 .type(MediaType.APPLICATION_JSON)
@@ -157,7 +164,6 @@ public class JanusDCRProvider implements ClientRegistrationProvider {
      * PUT /realms/{realm}/clients-registrations/openid-connect/{clientId}
      * Not supported by JANUS. MCP clients should submit a new DCR request.
      */
-    @Override
     public Response update(String clientId, InputStream inputStream) {
         return Response.status(501)
                 .type(MediaType.APPLICATION_JSON)
@@ -174,7 +180,6 @@ public class JanusDCRProvider implements ClientRegistrationProvider {
      * Not supported by JANUS. Stale registrations are cleaned up by the
      * lifecycle cleanup job.
      */
-    @Override
     public Response delete(String clientId) {
         return Response.status(501)
                 .type(MediaType.APPLICATION_JSON)
