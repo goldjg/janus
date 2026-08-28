@@ -1,0 +1,42 @@
+// parameters.bicepparam.example
+// Copy this file to parameters.bicepparam and fill in your values.
+// Do NOT commit parameters.bicepparam — it may contain sensitive values.
+
+using './main.bicep'
+
+// ─── Required parameters ──────────────────────────────────────────────────────
+
+param baseName = 'janus-prod'
+param location = 'australiaeast'
+
+// Microsoft Entra tenant ID
+// az account show --query tenantId -o tsv
+param tenantId = '<your-entra-tenant-id>'
+
+// App ID URI of the MCP gateway Entra application
+// e.g. api://<gateway-client-id>
+param gatewayResourceUri = 'api://<your-gateway-client-id>'
+
+// Azure Container Registry name (created by bootstrap script)
+param acrName = 'janusprod'   // adjust to match your ACR name
+
+// Tag of the janus-keycloak image to deploy
+param imageTag = 'latest'
+
+// Keycloak admin password — use Key Vault reference in production!
+// In production: use secretRef + Azure Key Vault instead of a plain string.
+param keycloakAdminPassword = '<set-a-strong-password>'
+
+// Output of the bootstrap script:
+//   bootstrap.ps1 -... outputs ManagedIdentityClientId and ManagedIdentityResourceId
+param managedIdentityClientId = '<output-from-bootstrap-script>'
+param managedIdentityResourceId = '<output-from-bootstrap-script>'
+
+// ─── Optional parameters ──────────────────────────────────────────────────────
+
+// Redirect URI prefix allowlist (comma-separated)
+// Default: loopback patterns for local MCP clients
+// param allowedRedirectPatterns = 'http://localhost:,http://127.0.0.1:,http://[::1]:'
+
+// Maximum redirect URIs per registration
+// param maxRedirectUris = 10

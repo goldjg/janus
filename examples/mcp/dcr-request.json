@@ -1,0 +1,10 @@
+{
+  "client_name": "Claude Code",
+  "redirect_uris": [
+    "http://localhost:7777/oauth/callback",
+    "http://127.0.0.1:7777/oauth/callback"
+  ],
+  "grant_types": ["authorization_code"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
