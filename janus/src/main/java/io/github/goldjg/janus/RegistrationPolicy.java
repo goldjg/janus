@@ -34,14 +34,16 @@ import java.util.regex.Pattern;
  */
 public class RegistrationPolicy {
 
-    /** Safe character pattern for client names. */
-    private static final Pattern CLIENT_NAME_PATTERN =
-            Pattern.compile("^[A-Za-z0-9 _\\-.]{1,64}$");
-
     private final JanusConfig config;
+
+    /** Compiled pattern based on config's max client name length — built once in the constructor. */
+    private final Pattern clientNamePattern;
 
     public RegistrationPolicy(JanusConfig config) {
         this.config = config;
+        // Bounded quantifier on a simple character class: no catastrophic backtracking risk.
+        this.clientNamePattern = Pattern.compile(
+                "^[A-Za-z0-9 _\\-.]{1," + config.getMaxClientNameLength() + "}$");
     }
 
     /**
@@ -72,10 +74,8 @@ public class RegistrationPolicy {
                     "invalid_client_metadata",
                     "client_name must not exceed " + config.getMaxClientNameLength() + " characters");
         }
-        // Validate character set with bounded pattern (no catastrophic backtracking risk
-        // because character classes with fixed quantifiers are safe).
-        String safePattern = "^[A-Za-z0-9 _\\-.]{1," + config.getMaxClientNameLength() + "}$";
-        if (!clientName.matches(safePattern)) {
+        // Validate character set using the pre-compiled pattern.
+        if (!clientNamePattern.matcher(clientName).matches()) {
             throw new RegistrationPolicyViolationException(
                     "invalid_client_metadata",
                     "client_name contains disallowed characters; "

@@ -99,10 +99,10 @@ public class GraphClientService {
      *
      * @param realmName  Keycloak realm name (used in tags and display name).
      * @param request    validated DCR request.
-     * @return the Entra {@code appId} (client ID) of the created registration.
+     * @return the created application info (appId and displayName).
      * @throws JanusRegistrationException if the Graph call fails.
      */
-    public String createApplication(String realmName, DcrRequest request) {
+    public CreatedApplication createApplication(String realmName, DcrRequest request) {
         String displayName = buildDisplayName(realmName, request.getClientName());
         String createdAt = Instant.now().toString();
 
@@ -133,8 +133,11 @@ public class GraphClientService {
         log.info("operation=create_application correlationId={} realm={} displayName={} appId={} objectId={}",
                 correlationId, realmName, displayName, app.appId, app.id);
 
-        return app.appId;
+        return new CreatedApplication(app.appId, displayName);
     }
+
+    /** Holds the Entra appId and display name returned by {@link #createApplication}. */
+    public record CreatedApplication(String appId, String displayName) {}
 
     /**
      * List all JANUS-managed application registrations for the given realm.
@@ -146,7 +149,7 @@ public class GraphClientService {
     public List<GraphApplicationResponse> listJanusApplications(String realmName) {
         String tag = TAG_REALM_PREFIX + realmName;
         String encodedTag = URLEncoder.encode(tag, StandardCharsets.UTF_8);
-        String path = "/applications?$filter=tags/any(t:t+eq+'" + encodedTag
+        String path = "/applications?$filter=tags/any(t:t%20eq%20'" + encodedTag
                 + "')&$count=true&$select=id,appId,displayName,notes,tags,createdDateTime";
 
         String responseBody = graphGet(path);

@@ -115,11 +115,9 @@ public class JanusDCRProvider implements ClientRegistrationProvider {
 
         // ── 3. Create Entra app registration ──────────────────────────────
         GraphClientService graphService = new GraphClientService(config, correlationId);
-        String entraAppId;
-        String entraDisplayName;
+        GraphClientService.CreatedApplication created;
         try {
-            entraDisplayName = GraphClientService.buildDisplayName(realmName, request.getClientName());
-            entraAppId = graphService.createApplication(realmName, request);
+            created = graphService.createApplication(realmName, request);
         } catch (JanusRegistrationException e) {
             log.error("operation=dcr_graph_error correlationId={} realm={} error={}",
                     correlationId, realmName, e.getMessage());
@@ -128,10 +126,10 @@ public class JanusDCRProvider implements ClientRegistrationProvider {
         }
 
         // ── 4. Return DCR response ────────────────────────────────────────
-        DcrResponse responseBody = new DcrResponse(entraAppId, entraDisplayName, request);
+        DcrResponse responseBody = new DcrResponse(created.appId(), created.displayName(), request);
 
         log.info("operation=dcr_success correlationId={} realm={} clientId={}",
-                correlationId, realmName, entraAppId);
+                correlationId, realmName, created.appId());
 
         return Response.status(201)
                 .type(MediaType.APPLICATION_JSON)
