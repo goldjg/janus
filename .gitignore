@@ -1,0 +1,113 @@
+# ---------------------------------------------------------------------------
+# JANUS .gitignore
+# ---------------------------------------------------------------------------
+
+# --- Java / Maven ----------------------------------------------------------
+target/
+build/
+out/
+bin/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.properties
+dependency-reduced-pom.xml
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+buildNumber.properties
+hs_err_pid*
+replay_pid*
+*.hprof
+
+# --- Gradle (in case a module is added later) ------------------------------
+.gradle/
+gradle-app.setting
+!gradle-wrapper.jar
+
+# --- Node ------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.npm/
+.yarn/
+.eslintcache
+coverage/
+.nyc_output/
+dist/
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# --- IDE / editors ---------------------------------------------------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+!.vscode/extensions.json
+.settings/
+.project
+.classpath
+.factorypath
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Azure / IaC -----------------------------------------------------------
+.azure/
+*.bicepparam.local
+main.json
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# --- Secrets / local configuration -----------------------------------------
+# JANUS never stores credentials in the repository. These patterns exist as a
+# defence-in-depth guard against accidental commits.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/testdata/**/*.pem
+!**/test/resources/**/*.pem
+*.pfx
+*.p12
+*.jks
+secrets.json
+local.settings.json
+azureauth.json
+kubeconfig
+
+# --- Build / scratch -------------------------------------------------------
+.probe/
+tmp/
+*.log
+!docs/**/*.log
