@@ -57,6 +57,9 @@ public class JanusDCRProvider implements ClientRegistrationProvider {
 
     @Override
     public void setAuth(ClientRegistrationAuth auth) {
+        // JANUS uses anonymous registration (public endpoint). Initial access
+        // tokens are not required but are supported if Keycloak is configured to
+        // enforce them for this realm. Stored for SPI contract compliance.
         this.auth = auth;
     }
 
@@ -67,6 +70,8 @@ public class JanusDCRProvider implements ClientRegistrationProvider {
 
     @Override
     public void setEvent(EventBuilder event) {
+        // Stored for SPI contract compliance; JANUS does not record Keycloak
+        // events for registrations.
         this.event = event;
     }
 
