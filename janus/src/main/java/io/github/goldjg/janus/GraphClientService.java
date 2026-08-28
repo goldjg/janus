@@ -1,8 +1,5 @@
 package io.github.goldjg.janus;
 
-import com.azure.core.credential.TokenRequestContext;
-import com.azure.identity.DefaultAzureCredential;
-import com.azure.identity.DefaultAzureCredentialBuilder;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -13,9 +10,11 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -29,12 +28,12 @@ import java.util.UUID;
  * only. It never acquires, caches, returns, or forwards a token intended for
  * the MCP gateway.
  *
- * <p>Authentication uses a User-Assigned Managed Identity via
- * {@link DefaultAzureCredential}. The {@code AZURE_CLIENT_ID} environment
- * variable should be set to the client ID of the user-assigned identity.
+ * <p>Authentication uses a User-Assigned Managed Identity via the Azure
+ * Instance Metadata Service (IMDS). The {@code AZURE_CLIENT_ID} environment
+ * variable must be set to the client ID of the user-assigned managed identity.
  *
- * <p>Graph API calls use {@code java.net.http.HttpClient} directly to avoid
- * pulling the full Microsoft Graph Java SDK into the extension classpath.
+ * <p>Uses {@code java.net.http.HttpClient} for all HTTP calls to avoid
+ * introducing heavy runtime dependencies into the Keycloak extension classpath.
  */
 public class GraphClientService {
 
@@ -43,8 +42,15 @@ public class GraphClientService {
     /** Microsoft Graph base URL. */
     private static final String GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
-    /** Graph scope for acquiring a token for the Graph API. */
-    private static final String GRAPH_SCOPE = "https://graph.microsoft.com/.default";
+    /**
+     * Azure IMDS token endpoint.
+     * The managed identity client ID is supplied via the {@code client_id} query parameter
+     * (or the {@code AZURE_CLIENT_ID} env var is used implicitly when not specified).
+     */
+    private static final String IMDS_TOKEN_URL =
+            "http://169.254.169.254/metadata/identity/oauth2/token"
+                    + "?api-version=2018-02-01"
+                    + "&resource=https%3A%2F%2Fgraph.microsoft.com";
 
     /** Tag applied to every JANUS-created registration. */
     public static final String TAG_JANUS_MANAGED = "janus-managed";
@@ -52,44 +58,40 @@ public class GraphClientService {
     /** Tag prefix that identifies the JANUS realm that created the registration. */
     public static final String TAG_REALM_PREFIX = "janus-realm:";
 
-    /** HTTP timeout for Graph calls. */
+    /** HTTP timeout for outbound calls. */
     private static final Duration HTTP_TIMEOUT = Duration.ofSeconds(15);
 
-    /** Maximum retries on Graph 429 (throttling). */
+    /** Maximum retries on Graph 429 (throttling) or 503. */
     private static final int MAX_RETRIES = 3;
 
-    /** Base back-off on throttle. */
+    /** Base back-off delay. Doubled on each retry. */
     private static final Duration INITIAL_RETRY_DELAY = Duration.ofSeconds(1);
 
     private final JanusConfig config;
     private final String correlationId;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
-    private final DefaultAzureCredential credential;
 
     public GraphClientService(JanusConfig config, String correlationId) {
         this(config, correlationId,
                 HttpClient.newBuilder()
                         .connectTimeout(HTTP_TIMEOUT)
                         .build(),
-                new ObjectMapper(),
-                new DefaultAzureCredentialBuilder().build());
+                new ObjectMapper());
     }
 
     /**
-     * Test constructor that accepts collaborator overrides.
+     * Package-private test constructor that accepts collaborator overrides.
      */
     GraphClientService(
             JanusConfig config,
             String correlationId,
             HttpClient httpClient,
-            ObjectMapper objectMapper,
-            DefaultAzureCredential credential) {
+            ObjectMapper objectMapper) {
         this.config = config;
         this.correlationId = correlationId;
         this.httpClient = httpClient;
         this.objectMapper = objectMapper;
-        this.credential = credential;
     }
 
     /**
@@ -143,8 +145,8 @@ public class GraphClientService {
      */
     public List<GraphApplicationResponse> listJanusApplications(String realmName) {
         String tag = TAG_REALM_PREFIX + realmName;
-        // Graph advanced query: filter by tag value
-        String path = "/applications?$filter=tags/any(t:t+eq+'" + encodeTag(tag)
+        String encodedTag = URLEncoder.encode(tag, StandardCharsets.UTF_8);
+        String path = "/applications?$filter=tags/any(t:t+eq+'" + encodedTag
                 + "')&$count=true&$select=id,appId,displayName,notes,tags,createdDateTime";
 
         String responseBody = graphGet(path);
@@ -264,17 +266,62 @@ public class GraphClientService {
                                 + "[correlationId=" + correlationId + "]");
             }
 
-            return response.body();
+            return response.body() != null ? response.body() : "";
         }
     }
 
-    private String acquireGraphToken() {
+    /**
+     * Acquire a Microsoft Graph access token using the Azure IMDS endpoint.
+     *
+     * <p>The managed identity client ID is read from the {@code AZURE_CLIENT_ID}
+     * environment variable. When running on Azure Container Apps with a
+     * user-assigned managed identity, this environment variable must be set.
+     *
+     * <p>The token is NOT cached or stored. A new token is acquired for each
+     * top-level operation. Azure IMDS handles token caching internally.
+     */
+    String acquireGraphToken() {
+        String url = IMDS_TOKEN_URL;
+        String managedIdentityClientId = System.getenv("AZURE_CLIENT_ID");
+        if (managedIdentityClientId != null && !managedIdentityClientId.isBlank()) {
+            url += "&client_id=" + URLEncoder.encode(managedIdentityClientId, StandardCharsets.UTF_8);
+        }
+
+        HttpRequest imdsRequest = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(HTTP_TIMEOUT)
+                .header("Metadata", "true")
+                .GET()
+                .build();
+
+        HttpResponse<String> imdsResponse;
         try {
-            var tokenRequestContext = new TokenRequestContext().addScopes(GRAPH_SCOPE);
-            return credential.getTokenSync(tokenRequestContext).getToken();
-        } catch (Exception e) {
+            imdsResponse = httpClient.send(imdsRequest, HttpResponse.BodyHandlers.ofString());
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             throw new JanusRegistrationException(
-                    "Failed to acquire Graph token [correlationId=" + correlationId + "]", e);
+                    "Failed to reach IMDS endpoint [correlationId=" + correlationId + "]", e);
+        }
+
+        if (imdsResponse.statusCode() != 200) {
+            throw new JanusRegistrationException(
+                    "IMDS returned status " + imdsResponse.statusCode()
+                            + " [correlationId=" + correlationId + "]");
+        }
+
+        try {
+            ObjectNode tokenResponse = (ObjectNode) objectMapper.readTree(imdsResponse.body());
+            String token = tokenResponse.path("access_token").asText(null);
+            if (token == null || token.isBlank()) {
+                throw new JanusRegistrationException(
+                        "IMDS response did not contain access_token [correlationId=" + correlationId + "]");
+            }
+            return token;
+        } catch (IOException e) {
+            throw new JanusRegistrationException(
+                    "Failed to parse IMDS token response [correlationId=" + correlationId + "]", e);
         }
     }
 
@@ -304,22 +351,18 @@ public class GraphClientService {
         if (value == null) {
             return "unknown";
         }
-        return value.toLowerCase()
+        String sanitised = value.toLowerCase()
                 .replaceAll("[^a-z0-9-]", "-")
                 .replaceAll("-+", "-")
-                .replaceAll("^-|-$", "")
-                .substring(0, Math.min(value.length(), maxLen));
-    }
-
-    private static String encodeTag(String tag) {
-        return tag.replace("'", "''");
+                .replaceAll("^-|-$", "");
+        return sanitised.substring(0, Math.min(sanitised.length(), maxLen));
     }
 
     private static Duration parseRetryAfter(HttpResponse<?> response, Duration fallback) {
         return response.headers().firstValue("Retry-After")
                 .map(v -> {
                     try {
-                        return Duration.ofSeconds(Long.parseLong(v));
+                        return Duration.ofSeconds(Long.parseLong(v.trim()));
                     } catch (NumberFormatException e) {
                         return fallback;
                     }

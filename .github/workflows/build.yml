@@ -1,0 +1,133 @@
+name: Build and Deploy JANUS
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write  # For pushing to GHCR if used instead of ACR
+
+jobs:
+  # ─── Build and Test ────────────────────────────────────────────────────────
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Java 17
+        uses: actions/setup-java@c5195efecf7bdcfb18b9c6e95d1a4d7ea7a7427  # v4.7.1
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build and test Keycloak extension
+        run: mvn clean verify -B
+        working-directory: janus
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
+        with:
+          name: test-results
+          path: janus/target/surefire-reports/
+
+      - name: Upload extension JAR
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
+        with:
+          name: janus-extension-jar
+          path: janus/target/janus-dcr-provider-*.jar
+
+  # ─── Container image build ─────────────────────────────────────────────────
+  build-image:
+    name: Build Container Image
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Download extension JAR
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babde5e1e7a9a3  # v4.1.9
+        with:
+          name: janus-extension-jar
+          path: janus/target/
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: ${{ secrets.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_CLIENT_ID }}
+          password: ${{ secrets.ACR_CLIENT_SECRET }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@902fa8ec7d6ecbea8a63c0ed1a7cdf8e3b57d2a6  # v5.7.0
+        with:
+          images: ${{ secrets.ACR_NAME }}.azurecr.io/janus-keycloak
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build and push container image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6.18.0
+        with:
+          context: janus
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─── Deploy ────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Azure
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Log in to Azure
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04abe2e7b45  # v2.3.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Bicep
+        uses: azure/arm-deploy@a1361c2781ae0a9b0e3a6c35b97ec86b62edf956  # v2.0.0
+        with:
+          resourceGroupName: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          template: infra/main.bicep
+          parameters: >
+            baseName=${{ secrets.JANUS_BASE_NAME }}
+            tenantId=${{ secrets.AZURE_TENANT_ID }}
+            gatewayResourceUri=${{ secrets.JANUS_GATEWAY_RESOURCE_URI }}
+            acrName=${{ secrets.ACR_NAME }}
+            imageTag=${{ needs.build-image.outputs.image-tag }}
+            keycloakAdminPassword=${{ secrets.KEYCLOAK_ADMIN_PASSWORD }}
+            managedIdentityClientId=${{ secrets.JANUS_MI_CLIENT_ID }}
+            managedIdentityResourceId=${{ secrets.JANUS_MI_RESOURCE_ID }}
+          deploymentName: janus-${{ github.run_number }}
+          failOnStdErr: true

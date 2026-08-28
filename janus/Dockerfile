@@ -1,11 +1,10 @@
 # ── Stage 1: Build the JANUS extension ─────────────────────────────────────
-FROM eclipse-temurin:17-jdk-jammy AS builder
+FROM maven:3.9.9-eclipse-temurin-17 AS builder
 
 WORKDIR /build
 
-# Copy Maven wrapper and pom first for layer caching
+# Copy pom first for dependency caching
 COPY pom.xml .
-COPY .mvn/ .mvn/
 
 # Download dependencies (cached layer if pom.xml unchanged)
 RUN mvn dependency:go-offline -q || true
@@ -17,13 +16,26 @@ RUN mvn clean package -DskipTests -q
 # ── Stage 2: Keycloak with JANUS extension ───────────────────────────────────
 FROM quay.io/keycloak/keycloak:24.0.5
 
+USER root
+
+# Create the JANUS runtime directory
+RUN mkdir -p /opt/janus
+
 # Install the JANUS extension JAR into the Keycloak providers directory.
 # Keycloak discovers extensions in /opt/keycloak/providers/ at startup.
-COPY --from=builder /build/target/janus-dcr-provider-*.jar /opt/keycloak/providers/
+# Also copy to /opt/janus/ for use by the cleanup job.
+COPY --from=builder /build/target/janus-dcr-provider.jar /opt/keycloak/providers/janus-dcr-provider.jar
+COPY --from=builder /build/target/janus-dcr-provider.jar /opt/janus/janus.jar
+
+# Cleanup job entry point script
+COPY cleanup.sh /opt/janus/cleanup.sh
+RUN chmod +x /opt/janus/cleanup.sh
 
 # Run Keycloak in build mode to index the new provider.
 # This is required by Keycloak 17+ to pre-compile providers.
 RUN /opt/keycloak/bin/kc.sh build
+
+USER keycloak
 
 # ── Runtime configuration ────────────────────────────────────────────────────
 # All secrets must be injected at runtime via environment variables.
@@ -45,6 +57,9 @@ RUN /opt/keycloak/bin/kc.sh build
 # JANUS_ALLOWED_REDIRECT_URI_PATTERNS  - Comma-separated redirect URI prefixes
 # JANUS_MAX_REDIRECT_URIS              - Max redirect URIs per registration
 # JANUS_CLEANUP_RETENTION_DAYS         - Cleanup retention in days
+
+# For cleanup job (Container Apps Job mode):
+# JANUS_REALM                      - Keycloak realm to clean up
 
 ENTRYPOINT ["/opt/keycloak/bin/kc.sh"]
 CMD ["start", "--optimized"]
