@@ -31,7 +31,7 @@ class RegistrationPolicyTest {
 
     @Test
     void validate_acceptsValidClientName() {
-        var ex = assertDoesNotThrow(() -> policy.validateClientName("Claude Code"));
+        assertDoesNotThrow(() -> policy.validateClientName("Claude Code"));
     }
 
     @Test
