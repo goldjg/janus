@@ -39,7 +39,7 @@ public class DcrResponse {
     public DcrResponse(String entraAppId, String displayName, DcrRequest request) {
         this.clientId = entraAppId;
         this.clientName = displayName;
-        this.redirectUris = request.getRedirectUris();
+        this.redirectUris = List.copyOf(request.getRedirectUris());
         this.grantTypes = List.of("authorization_code");
         this.responseTypes = List.of("code");
         this.tokenEndpointAuthMethod = "none";
@@ -55,7 +55,7 @@ public class DcrResponse {
     }
 
     public List<String> getRedirectUris() {
-        return redirectUris;
+        return List.copyOf(redirectUris);
     }
 
     public List<String> getGrantTypes() {

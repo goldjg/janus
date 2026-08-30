@@ -29,12 +29,14 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
         <!-- Keycloak -->
-        <keycloak.version>24.0.5</keycloak.version>
+        <keycloak.version>26.7.2</keycloak.version>
 
-        <!-- Jackson (provided by Keycloak runtime) -->
-        <jackson.version>2.17.1</jackson.version>
+        <!-- Jackson is available in Keycloak and bundled into cleanup classifier. -->
+        <jackson.version>2.21.5</jackson.version>
+        <!-- jackson-annotations uses a major.minor release cadence. -->
+        <jackson.annotations.version>2.21</jackson.annotations.version>
 
-        <!-- SLF4J (provided by Keycloak runtime) -->
+        <!-- SLF4J API is available in Keycloak and bundled into cleanup classifier. -->
         <slf4j.version>2.0.13</slf4j.version>
 
         <!-- Testing -->
@@ -77,32 +79,46 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- ═══ Jackson (provided by Keycloak runtime) ═══ -->
+        <!-- ═══ Jackson (thin provider uses Keycloak copy; cleanup bundles it) ═══ -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
             <version>${jackson.version}</version>
-            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>${jackson.version}</version>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-annotations</artifactId>
-            <version>${jackson.version}</version>
-            <scope>provided</scope>
+            <version>${jackson.annotations.version}</version>
         </dependency>
 
-        <!-- ═══ SLF4J (provided by Keycloak runtime) ═══ -->
+        <!-- ═══ SLF4J (thin provider uses Keycloak copy; cleanup bundles it) ═══ -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
             <version>${slf4j.version}</version>
-            <scope>provided</scope>
         </dependency>
 
         <!-- ═══ Test dependencies ═══ -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter</artifactId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-params</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-engine</artifactId>
             <version>${junit.version}</version>
             <scope>test</scope>
         </dependency>
@@ -112,18 +128,12 @@
             <version>${mockito.version}</version>
             <scope>test</scope>
         </dependency>
-        <dependency>
-            <groupId>org.mockito</groupId>
-            <artifactId>mockito-junit-jupiter</artifactId>
-            <version>${mockito.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <!-- SLF4J simple for tests -->
+        <!-- Standalone cleanup backend; not embedded in the thin provider JAR. -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-simple</artifactId>
             <version>${slf4j.version}</version>
-            <scope>test</scope>
+            <scope>runtime</scope>
         </dependency>
     </dependencies>
 
@@ -145,13 +155,23 @@
                 <version>3.3.1</version>
             </plugin>
 
-            <!-- Shade plugin: creates a self-contained JAR for the cleanup job.
-                 Only the JANUS classes are included; all Keycloak-provided
-                 dependencies (Jackson, SLF4J, Jakarta RS) are excluded because
-                 they are on Keycloak's classpath at runtime.
-                 The Keycloak extension itself does NOT need a fat JAR — Keycloak
-                 picks up the extension from providers/ and all provided-scope
-                 deps come from the Keycloak runtime. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.8.1</version>
+                <configuration>
+                    <!-- Runtime providers are discovered through ServiceLoader,
+                         so bytecode analysis cannot see these uses. -->
+                    <ignoredUnusedDeclaredDependencies>
+                        <ignoredUnusedDeclaredDependency>org.junit.jupiter:junit-jupiter-engine</ignoredUnusedDeclaredDependency>
+                        <ignoredUnusedDeclaredDependency>org.slf4j:slf4j-simple</ignoredUnusedDeclaredDependency>
+                    </ignoredUnusedDeclaredDependencies>
+                </configuration>
+            </plugin>
+
+            <!-- Attach a self-contained cleanup executable while preserving the
+                 primary thin provider JAR for Keycloak. Keycloak/Jakarta
+                 dependencies remain provided and are not bundled. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -164,7 +184,13 @@
                         </goals>
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
-                            <shadedArtifactAttached>false</shadedArtifactAttached>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>cleanup</shadedClassifierName>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>io.github.goldjg.janus.CleanupJob</mainClass>
+                                </transformer>
+                            </transformers>
                             <filters>
                                 <filter>
                                     <artifact>*:*</artifact>

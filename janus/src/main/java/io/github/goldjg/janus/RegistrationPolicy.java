@@ -2,247 +2,252 @@ package io.github.goldjg.janus;
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/**
- * Validates a {@link DcrRequest} against JANUS registration policy.
- *
- * <p>This class is a pure function: it takes a request and either returns
- * normally (validation passed) or throws a
- * {@link RegistrationPolicyViolationException} (validation failed). It has
- * no side effects.
- *
- * <h2>Policy summary</h2>
- * <ul>
- *   <li>{@code client_name}: required, 1–{@code maxClientNameLength} characters,
- *       safe character set {@code [A-Za-z0-9 _\-\.]}</li>
- *   <li>{@code redirect_uris}: required, non-empty, each URI must match an
- *       allowlist pattern, no duplicates, maximum
- *       {@code maxRedirectUris} entries</li>
- *   <li>{@code grant_types}: if present, must be exactly
- *       {@code ["authorization_code"]}</li>
- *   <li>{@code response_types}: if present, must be exactly
- *       {@code ["code"]}</li>
- *   <li>{@code token_endpoint_auth_method}: if present, must be
- *       {@code "none"}</li>
- *   <li>{@code scope}: if present, must be a subset of the configured
- *       allowed scopes (currently unrestricted beyond length)</li>
- * </ul>
- */
-public class RegistrationPolicy {
+/** Pure hostile-input policy for the DCR adapter. */
+public final class RegistrationPolicy {
+    private static final Pattern LOOPBACK_PATTERN = Pattern.compile(
+            "^http://(localhost|127\\.0\\.0\\.1|\\[::1]):\\{port}(/.*)$",
+            Pattern.CASE_INSENSITIVE);
+    private static final Pattern CLIENT_NAME_CHARS = Pattern.compile("[A-Za-z0-9 _\\-.]+");
+    private static final Pattern SCOPE_TOKEN = Pattern.compile("[\\x21\\x23-\\x5B\\x5D-\\x7E]+");
+    private static final Set<String> FORBIDDEN_REDIRECT_SCHEMES = Set.of(
+            "data", "file", "ftp", "javascript", "vbscript", "ws", "wss");
 
     private final JanusConfig config;
 
-    /** Compiled pattern based on config's max client name length — built once in the constructor. */
-    private final Pattern clientNamePattern;
-
     public RegistrationPolicy(JanusConfig config) {
-        this.config = config;
-        // Bounded quantifier on a simple character class: no catastrophic backtracking risk.
-        this.clientNamePattern = Pattern.compile(
-                "^[A-Za-z0-9 _\\-.]{1," + config.getMaxClientNameLength() + "}$");
+        this.config = java.util.Objects.requireNonNull(config, "config");
     }
 
-    /**
-     * Validate {@code request} against policy.
-     *
-     * @param request the parsed DCR request; must not be null.
-     * @throws RegistrationPolicyViolationException if validation fails.
-     */
-    public void validate(DcrRequest request) {
+    /** Validate and normalize the request. Defaults remain explicit in the returned value. */
+    public ValidatedRegistration validate(DcrRequest request) {
+        if (request == null) {
+            violation("invalid_client_metadata", "registration request is required");
+        }
         validateClientName(request.getClientName());
         validateRedirectUris(request.getRedirectUris());
         validateGrantTypes(request.getGrantTypes());
         validateResponseTypes(request.getResponseTypes());
         validateTokenEndpointAuthMethod(request.getTokenEndpointAuthMethod());
-        validateScope(request.getScope());
+        List<String> scopes = validateScope(request.getScope());
+        return new ValidatedRegistration(request.getClientName(), List.copyOf(request.getRedirectUris()), scopes);
     }
-
-    // ─── Validators ───────────────────────────────────────────────────────
 
     void validateClientName(String clientName) {
         if (clientName == null || clientName.isBlank()) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_client_metadata",
-                    "client_name is required and must not be blank");
+            violation("invalid_client_metadata", "client_name is required and must not be blank");
         }
         if (clientName.length() > config.getMaxClientNameLength()) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_client_metadata",
+            violation("invalid_client_metadata",
                     "client_name must not exceed " + config.getMaxClientNameLength() + " characters");
         }
-        // Validate character set using the pre-compiled pattern.
-        if (!clientNamePattern.matcher(clientName).matches()) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_client_metadata",
-                    "client_name contains disallowed characters; "
-                            + "only letters, digits, spaces, underscores, hyphens, and dots are permitted");
+        if (!CLIENT_NAME_CHARS.matcher(clientName).matches()) {
+            violation("invalid_client_metadata",
+                    "client_name contains disallowed characters; only ASCII letters, digits, spaces, "
+                            + "underscores, hyphens, and dots are permitted");
         }
     }
 
     void validateRedirectUris(List<String> redirectUris) {
         if (redirectUris == null || redirectUris.isEmpty()) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_redirect_uri",
-                    "redirect_uris is required and must not be empty");
+            violation("invalid_redirect_uri", "redirect_uris is required and must not be empty");
         }
         if (redirectUris.size() > config.getMaxRedirectUris()) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_redirect_uri",
-                    "redirect_uris must not contain more than " + config.getMaxRedirectUris()
-                            + " entries");
+            violation("invalid_redirect_uri",
+                    "redirect_uris must not contain more than " + config.getMaxRedirectUris() + " entries");
         }
-        // Reject duplicates
         Set<String> seen = new HashSet<>();
-        for (String uri : redirectUris) {
-            if (!seen.add(uri)) {
-                throw new RegistrationPolicyViolationException(
-                        "invalid_redirect_uri",
-                        "redirect_uris contains duplicate entry: " + sanitiseForError(uri));
+        for (String redirectUri : redirectUris) {
+            if (redirectUri == null || redirectUri.isBlank()) {
+                violation("invalid_redirect_uri", "redirect_uris contains a blank entry");
             }
-        }
-        // Validate each URI
-        for (String uri : redirectUris) {
-            validateSingleRedirectUri(uri);
+            if (!seen.add(redirectUri)) {
+                violation("invalid_redirect_uri", "redirect_uris contains a duplicate entry");
+            }
+            validateSingleRedirectUri(redirectUri);
         }
     }
 
-    private void validateSingleRedirectUri(String uriStr) {
-        if (uriStr == null || uriStr.isBlank()) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_redirect_uri", "redirect_uris contains a blank entry");
-        }
-        if (uriStr.length() > config.getMaxFieldLength()) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_redirect_uri",
+    private void validateSingleRedirectUri(String raw) {
+        if (raw.length() > config.getMaxFieldLength()) {
+            violation("invalid_redirect_uri",
                     "redirect_uri exceeds maximum length of " + config.getMaxFieldLength());
         }
-
-        // Parse the URI to detect obvious malformation and fragments
-        URI parsed;
-        try {
-            parsed = new URI(uriStr);
-        } catch (URISyntaxException e) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_redirect_uri",
-                    "redirect_uri is not a valid URI: " + sanitiseForError(uriStr));
+        if (raw.indexOf('*') >= 0) {
+            violation("invalid_redirect_uri", "redirect_uri must not contain a wildcard");
         }
-
-        // Fragments are explicitly forbidden by RFC 6749 §3.1.2
-        if (parsed.getFragment() != null) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_redirect_uri",
-                    "redirect_uri must not contain a fragment");
+        URI uri = parseAbsoluteRedirect(raw);
+        String scheme = uri.getScheme().toLowerCase(Locale.ROOT);
+        if (FORBIDDEN_REDIRECT_SCHEMES.contains(scheme)) {
+            violation("invalid_redirect_uri", "redirect_uri uses a forbidden scheme");
         }
-
-        // Scheme must be present
-        String scheme = parsed.getScheme();
-        if (scheme == null) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_redirect_uri",
-                    "redirect_uri must include a scheme");
+        if (uri.getFragment() != null || uri.getUserInfo() != null) {
+            violation("invalid_redirect_uri", "redirect_uri must not contain userinfo or a fragment");
         }
-
-        // Reject data:, javascript:, and other dangerous schemes
-        if (scheme.equalsIgnoreCase("data") || scheme.equalsIgnoreCase("javascript")) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_redirect_uri",
-                    "redirect_uri scheme '" + scheme + "' is not permitted");
+        if ((scheme.equals("http") || scheme.equals("https")) && uri.getHost() == null) {
+            violation("invalid_redirect_uri", "network redirect_uri must include a host");
         }
-
-        // Check against the configured allowlist
-        boolean allowed = false;
-        for (String pattern : config.getAllowedRedirectPatterns()) {
-            if (uriStr.startsWith(pattern.trim())) {
-                allowed = true;
-                break;
-            }
+        if (scheme.equals("http") && (!isLoopbackHost(uri.getHost()) || uri.getPort() < 1)) {
+            violation("invalid_redirect_uri",
+                    "http redirect_uri requires an explicit port on localhost, 127.0.0.1, or [::1]");
         }
-        if (!allowed) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_redirect_uri",
-                    "redirect_uri does not match any permitted pattern");
-        }
-
-        // For http:// URIs that are allowed, the host must be loopback only
-        if (scheme.equalsIgnoreCase("http")) {
-            String host = parsed.getHost();
-            if (host == null || !isLoopbackHost(host)) {
-                throw new RegistrationPolicyViolationException(
-                        "invalid_redirect_uri",
-                        "http redirect_uri is only permitted for loopback addresses "
-                                + "(localhost, 127.0.0.1, [::1])");
-            }
+        boolean matched = config.getAllowedRedirectPatterns().stream()
+                .anyMatch(pattern -> matchesConfiguredPattern(pattern, raw, uri));
+        if (!matched) {
+            violation("invalid_redirect_uri", "redirect_uri does not exactly match a permitted rule");
         }
     }
 
-    void validateGrantTypes(List<String> grantTypes) {
-        if (grantTypes == null) {
-            return; // defaults to authorization_code
-        }
-        if (grantTypes.size() != 1 || !grantTypes.get(0).equals("authorization_code")) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_client_metadata",
-                    "grant_types must be [\"authorization_code\"] or omitted");
-        }
+    void validateGrantTypes(List<String> values) {
+        exactSingleton(values, "authorization_code", "grant_types");
     }
 
-    void validateResponseTypes(List<String> responseTypes) {
-        if (responseTypes == null) {
-            return; // defaults to code
-        }
-        if (responseTypes.size() != 1 || !responseTypes.get(0).equals("code")) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_client_metadata",
-                    "response_types must be [\"code\"] or omitted");
-        }
+    void validateResponseTypes(List<String> values) {
+        exactSingleton(values, "code", "response_types");
     }
 
     void validateTokenEndpointAuthMethod(String method) {
-        if (method == null) {
-            return; // defaults to none
-        }
-        if (!method.equals("none")) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_client_metadata",
-                    "token_endpoint_auth_method must be \"none\" or omitted; "
-                            + "JANUS creates public clients only");
+        if (method != null && !method.equals("none")) {
+            violation("invalid_client_metadata",
+                    "token_endpoint_auth_method must be none or omitted; JANUS creates public clients only");
         }
     }
 
-    void validateScope(String scope) {
-        if (scope == null) {
-            return;
+    List<String> validateScope(String scope) {
+        if (scope == null || scope.isBlank()) {
+            violation("invalid_client_metadata", "scope is required and must identify an approved gateway scope");
         }
         if (scope.length() > config.getMaxFieldLength()) {
-            throw new RegistrationPolicyViolationException(
-                    "invalid_client_metadata",
-                    "scope exceeds maximum length of " + config.getMaxFieldLength());
+            violation("invalid_client_metadata", "scope exceeds maximum length of " + config.getMaxFieldLength());
+        }
+        if (!scope.equals(scope.trim()) || scope.contains("  ")) {
+            violation("invalid_client_metadata", "scope must use single spaces with no surrounding whitespace");
+        }
+        List<String> accepted = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (String token : scope.split(" ", -1)) {
+            if (!SCOPE_TOKEN.matcher(token).matches()) {
+                violation("invalid_client_metadata", "scope contains a malformed token");
+            }
+            if (!seen.add(token)) {
+                violation("invalid_client_metadata", "scope contains a duplicate value");
+            }
+            if (!config.getAllowedGatewayScopes().contains(token)) {
+                violation("invalid_client_metadata", "scope contains a value that is not approved for the gateway");
+            }
+            accepted.add(token);
+        }
+        return List.copyOf(accepted);
+    }
+
+    static void validateConfiguredRedirectPattern(String pattern) {
+        Matcher loopback = LOOPBACK_PATTERN.matcher(pattern);
+        if (loopback.matches()) {
+            String path = loopback.group(2);
+            if (path.indexOf('*') >= 0 && !path.endsWith("/*")) {
+                throw new IllegalArgumentException("redirect wildcard is permitted only as a final /*");
+            }
+            if (path.substring(0, path.length() - (path.endsWith("/*") ? 1 : 0)).contains("*")) {
+                throw new IllegalArgumentException("redirect pattern contains an unsupported wildcard");
+            }
+            return;
+        }
+        if (pattern.contains("{port}") || pattern.contains("*")) {
+            throw new IllegalArgumentException(
+                    "redirect pattern variables are allowed only for explicit HTTP loopback rules");
+        }
+        URI exact = parseAbsoluteConfigUri(pattern);
+        String scheme = exact.getScheme().toLowerCase(Locale.ROOT);
+        if (FORBIDDEN_REDIRECT_SCHEMES.contains(scheme)) {
+            throw new IllegalArgumentException("redirect pattern uses a forbidden scheme");
+        }
+        if (exact.getFragment() != null || exact.getUserInfo() != null) {
+            throw new IllegalArgumentException("redirect pattern must not contain userinfo or a fragment");
+        }
+        if (scheme.equals("http")) {
+            throw new IllegalArgumentException("HTTP redirect patterns must use the explicit {port} loopback form");
+        }
+        if (scheme.equals("https") && exact.getHost() == null) {
+            throw new IllegalArgumentException("HTTPS redirect pattern must include a host");
         }
     }
 
-    // ─── Helpers ──────────────────────────────────────────────────────────
+    private static boolean matchesConfiguredPattern(String pattern, String raw, URI uri) {
+        Matcher matcher = LOOPBACK_PATTERN.matcher(pattern);
+        if (!matcher.matches()) {
+            return pattern.equals(raw);
+        }
+        if (!uri.getScheme().equalsIgnoreCase("http") || uri.getPort() < 1
+                || !normaliseLoopback(matcher.group(1)).equals(normaliseLoopback(uri.getHost()))) {
+            return false;
+        }
+        String configuredPath = matcher.group(2);
+        String actualPath = uri.getRawPath();
+        if (actualPath == null || actualPath.isEmpty()) {
+            actualPath = "/";
+        }
+        boolean pathMatches = configuredPath.endsWith("/*")
+                ? actualPath.startsWith(configuredPath.substring(0, configuredPath.length() - 1))
+                : actualPath.equals(configuredPath);
+        return pathMatches && uri.getRawQuery() == null;
+    }
+
+    private static URI parseAbsoluteRedirect(String raw) {
+        try {
+            URI uri = new URI(raw);
+            if (!uri.isAbsolute() || uri.getScheme() == null) {
+                violation("invalid_redirect_uri", "redirect_uri must be an absolute URI");
+            }
+            return uri;
+        } catch (URISyntaxException e) {
+            violation("invalid_redirect_uri", "redirect_uri is malformed");
+            throw new AssertionError("unreachable");
+        }
+    }
+
+    private static URI parseAbsoluteConfigUri(String raw) {
+        try {
+            URI uri = new URI(raw);
+            if (!uri.isAbsolute() || uri.getScheme() == null) {
+                throw new IllegalArgumentException("redirect pattern must be an absolute URI");
+            }
+            return uri;
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException("redirect pattern is malformed", e);
+        }
+    }
 
     private static boolean isLoopbackHost(String host) {
-        return host.equals("localhost")
-                || host.equals("127.0.0.1")
-                || host.equals("[::1]")
-                || host.equals("::1");
+        return host != null && (host.equalsIgnoreCase("localhost") || host.equals("127.0.0.1")
+                || host.equals("::1") || host.equals("[::1]"));
     }
 
-    /**
-     * Returns a truncated, safe representation of a string for inclusion in an
-     * error message. Never includes the full original value to avoid reflecting
-     * injected content.
-     */
-    private static String sanitiseForError(String value) {
-        if (value == null) {
-            return "(null)";
+    private static String normaliseLoopback(String host) {
+        return host == null ? "" : host.replace("[", "").replace("]", "").toLowerCase(Locale.ROOT);
+    }
+
+    private static void exactSingleton(List<String> values, String allowed, String field) {
+        if (values != null && (values.size() != 1 || !allowed.equals(values.get(0)))) {
+            violation("invalid_client_metadata", field + " must be [\"" + allowed + "\"] or omitted");
         }
-        String safe = value.replaceAll("[\\r\\n\\t]", " ");
-        return safe.length() > 80 ? safe.substring(0, 80) + "…" : safe;
+    }
+
+    private static void violation(String code, String description) {
+        throw new RegistrationPolicyViolationException(code, description);
+    }
+
+    /** Protocol-neutral result consumed by the provisioning core. */
+    public record ValidatedRegistration(String clientName, List<String> redirectUris, List<String> scopes) {
+        public ValidatedRegistration {
+            redirectUris = List.copyOf(redirectUris);
+            scopes = List.copyOf(scopes);
+        }
     }
 }

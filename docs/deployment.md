@@ -1,143 +1,173 @@
-# JANUS Deployment Guide
+# Deployment guide
+
+The supported production path is: tenant bootstrap, protected GitHub
+Environment configuration, then the OIDC deployment workflow. JANUS does not
+use a GitHub client secret or a runtime Microsoft Graph client secret.
 
 ## Prerequisites
 
-| Tool | Version | Notes |
-|---|---|---|
-| Azure CLI | ≥ 2.50 | `az login` must be run before proceeding |
-| PowerShell | 7+ | For bootstrap script |
-| Microsoft.Graph PowerShell module | ≥ 2.0 | Installed by bootstrap script if absent |
-| Java | 17 | For building the JANUS extension |
-| Maven | ≥ 3.8 | For building the JANUS extension |
-| Docker | Any recent | For building the container image |
+- PowerShell 7, Azure CLI, and `Microsoft.Graph.Authentication` 2.x
+- an Azure subscription and commercial Microsoft Entra tenant
+- a GitHub repository whose `production` Environment can require reviewers
+- tenant authority to create or inspect applications, service principals,
+  federated credentials, app-role assignments, and admin consent
+- Azure authority to create the prerequisite resource group, ACR, user-assigned
+  identity, and resource-scoped role assignments
 
-## Step 1: Build the JANUS extension
+The initial implementation assumes Azure commercial-cloud endpoints. Validate
+sovereign-cloud endpoints and service availability separately.
 
-```bash
-cd janus
-mvn clean package -DskipTests
-```
-
-This produces `target/janus-dcr-provider-<version>.jar`.
-
-## Step 2: Build and push the container image
-
-The JANUS container image extends the official Keycloak image with the JANUS extension JAR.
-
-```bash
-# Set your registry details
-export ACR_NAME="<your-azure-container-registry-name>"
-export IMAGE_TAG="$(git rev-parse --short HEAD)"
-
-# Build
-docker build \
-  -t "${ACR_NAME}.azurecr.io/janus-keycloak:${IMAGE_TAG}" \
-  -f janus/Dockerfile \
-  janus/
-
-# Push (requires `az acr login --name $ACR_NAME`)
-az acr login --name "${ACR_NAME}"
-docker push "${ACR_NAME}.azurecr.io/janus-keycloak:${IMAGE_TAG}"
-```
-
-## Step 3: Configure parameters
-
-Copy and edit the parameters file:
-
-```bash
-cp infra/parameters.bicepparam.example infra/parameters.bicepparam
-```
-
-Fill in all required values. See comments in `parameters.bicepparam.example` for guidance.
-
-Required parameters:
-
-| Parameter | Description |
-|---|---|
-| `tenantId` | Entra tenant ID |
-| `gatewayResourceUri` | App ID URI of the MCP gateway Entra application (`api://<client-id>`) |
-| `acrName` | Azure Container Registry name |
-| `imageTag` | Container image tag to deploy |
-| `keycloakAdminPasswordSecretRef` | Reference to Keycloak admin password in Key Vault |
-
-## Step 4: Run bootstrap (one-time)
-
-The bootstrap script performs one-time setup that cannot be done via Bicep alone:
+## 1. Bootstrap with a dry run
 
 ```powershell
 ./bootstrap/bootstrap.ps1 `
-  -TenantId "<tenant-id>" `
-  -SubscriptionId "<subscription-id>" `
-  -ResourceGroup "rg-janus-prod" `
-  -Location "australiaeast" `
-  -ManagedIdentityName "mi-janus-prod"
+  -TenantId '<tenant-uuid>' `
+  -SubscriptionId '<subscription-uuid>' `
+  -ResourceGroup 'rg-janus-prod' `
+  -Location 'uksouth' `
+  -EnvironmentName 'prod' `
+  -AcrName '<globally-unique-acr-name>' `
+  -GitHubOwner '<owner>' `
+  -GitHubRepository '<repository>' `
+  -GitHubEnvironment 'production' `
+  -GatewayDisplayName 'JANUS MCP Gateway' `
+  -WhatIf -Verbose
 ```
 
-The bootstrap script:
+Review every proposed tenant and Azure change. Then rerun without `-WhatIf`;
+the script uses PowerShell `ShouldProcess`, safe discovery, and idempotent
+updates where practical. To reuse a gateway application, pass its client ID as
+`-GatewayApplicationClientId`.
 
-1. Creates the resource group if it does not exist
-2. Creates the User-Assigned Managed Identity if it does not exist
-3. Assigns `Application.ReadWrite.OwnedBy` Graph app role to the Managed Identity
-4. Outputs the Managed Identity client ID and object ID for use in `parameters.bicepparam`
+Bootstrap creates or locates only prerequisites: resource group, ACR, runtime
+user-assigned identity, gateway application/service principal, GitHub
+deployment application/service principal, federated credential, scoped Azure
+roles, and the runtime identity's `Application.ReadWrite.OwnedBy` Graph role.
+It does not deploy JANUS and emits no reusable credential.
 
-> **Note:** You must have `Application Administrator` or `Global Administrator` Entra role to run the Graph role assignment step. Azure `Owner` on the subscription is not sufficient.
+Save the JSON output if desired:
 
-## Step 5: Deploy infrastructure
+```powershell
+./bootstrap/bootstrap.ps1 @parameters -OutputJsonPath './janus-bootstrap-output.json'
+```
+
+Treat this output as operational configuration even though it contains
+identifiers rather than credentials. Do not commit it.
+
+## 2. Configure GitHub
+
+Create and protect the Environment named during bootstrap. Add the printed
+`githubVariables` as repository or Environment variables, including:
+
+- `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_DEPLOYMENT_CLIENT_ID`
+- `AZURE_RESOURCE_GROUP`, `AZURE_LOCATION`, `JANUS_ENVIRONMENT_NAME`
+- `JANUS_GATEWAY_CLIENT_ID`, `JANUS_GATEWAY_RESOURCE_URI`
+- `JANUS_ALLOWED_GATEWAY_SCOPES`
+- `JANUS_RUNTIME_MI_CLIENT_ID`, `JANUS_RUNTIME_MI_RESOURCE_ID`
+- `ACR_NAME`
+- `JANUS_CLEANUP_RETENTION_DAYS` and `JANUS_CLEANUP_DRY_RUN`
+- `JANUS_EXTERNAL_INGRESS_ENABLED`
+
+Add two independent high-entropy Environment secrets:
+
+- `KEYCLOAK_ADMIN_PASSWORD`
+- `KEYCLOAK_POSTGRES_PASSWORD`
+
+The Keycloak/PostgreSQL passwords are genuine persistent secrets, stored as
+protected GitHub Environment secrets and Azure Container Apps secrets. JANUS
+has no OAuth or Graph client secret, so Key Vault is not introduced solely as
+decoration. Organisations with an existing approved secret platform can adapt
+the Bicep module.
+
+Optional variables include explicit redirect rules and the three existing
+network resource IDs shown in the workflow. Configure all three network IDs or
+none. Keep production deployment behind required Environment reviewers.
+
+## 3. Validate and deploy
+
+Pull requests run Java tests, bootstrap safety checks, Maven dependency
+analysis, and Bicep compilation without Azure authentication or deployment.
+The workflow builds and scans an image, publishes it to ACR, resolves the
+immutable digest, and passes that digest to Bicep.
+
+Use `workflow_dispatch` for deliberate production deployment. Push-to-main is
+also wired to the protected `production` Environment; required reviewers remain
+the approval boundary.
+
+The deployment creates:
+
+- Log Analytics and ACR diagnostics
+- a VNet, delegated subnets, and PostgreSQL private DNS unless existing IDs are supplied
+- a Container Apps environment and JANUS Container App
+- PostgreSQL Flexible Server for persistent Keycloak state
+- the scheduled cleanup Container Apps Job
+
+The image imports the minimal `janus` realm on first startup. Runtime
+registration policy comes from fail-closed environment settings rather than
+the realm export.
+
+## 4. Issue bounded registration admission
+
+JANUS never supports anonymous unlimited application creation. After deployment,
+an administrator creates a short-lived Keycloak initial access token for the
+`janus` realm with a small registration count and distributes it only to an
+approved MCP client operator. Supply it as:
+
+```http
+Authorization: Bearer <initial-access-token>
+```
+
+The DCR URL is the workflow's `dcrEndpoint` output. Creating the admission
+token is deliberately an operator action because its expiry and object budget
+are security decisions.
+
+## 5. Verify the handoff
+
+1. Confirm the active Container App revision is healthy.
+2. Submit an admitted request based on `examples/mcp/dcr-request.json`.
+3. Inspect the returned `client_id` in Entra and confirm it is single tenant,
+   public, credential-free, marked with all JANUS ownership tags, and declares
+   only the approved gateway delegated permission.
+4. Run Authorization Code with PKCE directly against the permitted Entra tenant.
+5. Confirm the gateway token issuer is Entra, its audience is the gateway, and
+   JANUS never sees the authorization code or token.
+6. Confirm an unassigned or non-member user is denied by the gateway even after
+   successful registration.
+
+These live checks are opt-in and should use a dedicated test client/operator.
+
+## Network exposure
+
+Public ingress defaults off. If DCR must be internet reachable, initial-access
+tokens remain mandatory and an edge control such as Azure Front Door WAF rate
+limiting should bound requests across all replicas. Container Apps CIDR rules
+can narrow sources but are not a general distributed rate limiter. Do not
+enable public ingress merely to make a smoke test convenient.
+
+The supplied deployment also defaults to one replica because idempotency and
+secondary rate counters are process-local. Increase replicas only with a
+reviewed distributed edge limit and an accepted cross-replica duplicate/race
+strategy.
+
+## Cleanup enablement
+
+Cleanup defaults to dry-run. The initial job will retain an old application
+unless all ownership markers and fresh, unambiguous activity-evidence markers
+exist. Review [lifecycle.md](lifecycle.md) before attaching a trusted sign-in
+observer or setting `JANUS_CLEANUP_DRY_RUN=false`.
+
+## Local validation
 
 ```bash
-az deployment group create \
-  --resource-group rg-janus-prod \
-  --template-file infra/main.bicep \
-  --parameters infra/parameters.bicepparam \
-  --name "janus-$(date +%Y%m%d-%H%M%S)"
+cd janus
+mvn -B clean verify
+cd ..
+az bicep build --file infra/main.bicep --stdout >/dev/null
+pwsh -NoProfile -File bootstrap/Test-BootstrapStatic.ps1
+docker build -t janus:local janus
 ```
 
-## Step 6: Configure Keycloak realm
+On an ARM64 Raspberry Pi, the last command builds the native ARM64 image. The
+GitHub workflow builds the production `linux/amd64` image.
 
-After the Keycloak Container App is running, configure the JANUS realm:
-
-```bash
-# Get the Keycloak FQDN from the deployment output
-KEYCLOAK_FQDN=$(az deployment group show \
-  --resource-group rg-janus-prod \
-  --name <deployment-name> \
-  --query properties.outputs.keycloakFqdn.value -o tsv)
-
-# The bootstrap script can also handle this step
-./bootstrap/bootstrap.ps1 `
-  -TenantId "<tenant-id>" `
-  -SubscriptionId "<subscription-id>" `
-  -ResourceGroup "rg-janus-prod" `
-  -Location "australiaeast" `
-  -KeycloakFqdn "${KEYCLOAK_FQDN}" `
-  -ConfigureRealm
-```
-
-## Step 7: Verify
-
-```bash
-# Check DCR endpoint is live
-curl -f "https://${KEYCLOAK_FQDN}/realms/janus/.well-known/openid-configuration"
-
-# Verify JANUS extension is loaded (should include janus-dcr in providers)
-curl -f "https://${KEYCLOAK_FQDN}/realms/janus/clients-registrations/providers"
-```
-
-## CI/CD deployment
-
-The GitHub Actions workflow (`.github/workflows/build.yml`) automates the build, image push, and deployment steps. See the workflow file for required secrets and environment setup.
-
-## Upgrading
-
-1. Build and push a new container image with the new `imageTag`.
-2. Update `imageTag` in `parameters.bicepparam`.
-3. Re-run `az deployment group create` (step 5). Container Apps performs a rolling update.
-
-## Rollback
-
-To roll back to a previous image tag:
-
-1. Update `imageTag` in `parameters.bicepparam` to the previous tag.
-2. Re-run `az deployment group create`.
-
-Container App revisions also support direct revision management via the Azure Portal or CLI.
+Rollback, incident response, and removal are in [operations.md](operations.md).

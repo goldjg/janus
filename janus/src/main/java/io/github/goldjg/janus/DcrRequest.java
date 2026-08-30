@@ -43,27 +43,27 @@ public class DcrRequest {
     }
 
     public List<String> getRedirectUris() {
-        return redirectUris;
+        return redirectUris == null ? null : List.copyOf(redirectUris);
     }
 
     public void setRedirectUris(List<String> redirectUris) {
-        this.redirectUris = redirectUris;
+        this.redirectUris = redirectUris == null ? null : List.copyOf(redirectUris);
     }
 
     public List<String> getGrantTypes() {
-        return grantTypes;
+        return grantTypes == null ? null : List.copyOf(grantTypes);
     }
 
     public void setGrantTypes(List<String> grantTypes) {
-        this.grantTypes = grantTypes;
+        this.grantTypes = grantTypes == null ? null : List.copyOf(grantTypes);
     }
 
     public List<String> getResponseTypes() {
-        return responseTypes;
+        return responseTypes == null ? null : List.copyOf(responseTypes);
     }
 
     public void setResponseTypes(List<String> responseTypes) {
-        this.responseTypes = responseTypes;
+        this.responseTypes = responseTypes == null ? null : List.copyOf(responseTypes);
     }
 
     public String getTokenEndpointAuthMethod() {

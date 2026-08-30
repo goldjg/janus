@@ -1,157 +1,137 @@
-# JANUS Security Model
+# Security model
 
-## Core invariant
+## Primary invariant
 
-> **No JANUS component may issue, proxy, cache, exchange, or re-sign the bearer token used to access the protected MCP gateway. Microsoft Entra ID must remain the issuer of the gateway access token.**
+> No JANUS component may issue, proxy, cache, exchange, re-sign, inspect for
+> reuse, or store the bearer token used to access the protected MCP gateway.
 
-This invariant is enforced architecturally: JANUS has no code path that returns, caches, or forwards an access token intended for gateway consumption. JANUS does not implement a token endpoint. It does not expose any OAuth authorize endpoint.
+Microsoft Entra ID is the authorization server and token issuer. The MCP
+gateway validates and authorizes Entra tokens independently. Keycloak is only a
+legacy registration-protocol adapter.
 
-## Security properties
+## What registration grants
 
-### 1. Registration-only surface
+A successful request grants one thing: an Entra public-client application ID.
+It does not grant:
 
-JANUS exposes only the DCR registration endpoint (`POST /realms/{realm}/clients-registrations/openid-connect`). It does not expose:
+- tenant or gateway consent;
+- user/group assignment;
+- a gateway role;
+- a client secret or certificate;
+- an access or refresh token;
+- acceptance by Conditional Access;
+- permission to invoke an MCP tool.
 
-- Token endpoints
-- Authorization endpoints
-- Introspection endpoints
-- Revocation endpoints
-- UserInfo endpoints
-- JWKS endpoints for gateway consumption
+## Generated client properties
 
-### 2. Public clients only
+JANUS-generated applications are constrained to:
 
-Every Entra application registration JANUS creates is a public client:
+- `AzureADMyOrg` single-tenant audience;
+- public-client redirect configuration;
+- authorization code flow metadata;
+- exact policy-approved redirects;
+- explicitly configured gateway delegated scopes only;
+- no password or key credentials;
+- no Graph permissions unrelated to the gateway;
+- explicit JANUS environment/realm/lifecycle markers;
+- collision-resistant, operationally recognizable display names.
 
-```json
-{
-  "isFallbackPublicClient": true,
-  "publicClient": {
-    "redirectUris": ["<allowlisted URIs>"]
-  }
-}
-```
+Declaring `requiredResourceAccess` identifies a requested API permission but
+does not grant consent, assignment or gateway authorization.
 
-JANUS never:
-- Creates client secrets
-- Creates certificate credentials
-- Assigns API permissions unrelated to the gateway resource
+## DCR admission and hostile input
 
-### 3. Least-privilege Graph permission
+The endpoint must not operate as an anonymous unlimited tenant-object factory.
+Production operation requires configured admission and bounded creation.
 
-JANUS requires only `Application.ReadWrite.OwnedBy` (application permission), which limits JANUS to reading and modifying only the app registrations it created. JANUS cannot read or modify app registrations owned by other applications or users.
+Before Graph provisioning, JANUS rejects:
 
-JANUS does not require:
-- `Application.ReadWrite.All`
-- `Directory.ReadWrite.All`
-- `User.Read.All`
-- Any delegated permissions
+- requests above the total byte limit;
+- unknown or unsupported metadata;
+- missing/unsafe client names;
+- missing, duplicate, malformed or unapproved redirect URIs;
+- URI fragments, userinfo, wildcards and nonnumeric loopback ports;
+- confidential-client authentication methods;
+- grants or response types other than authorization code/code;
+- scopes outside the configured gateway allowlist;
+- requests that fail admission, idempotency or creation-rate policy;
+- missing or malformed critical tenant/resource configuration.
 
-### 4. Managed Identity authentication
+Application-level admission is required even with edge throttling. Source IP
+limits alone are not an identity mechanism and can be unreliable behind shared
+proxies.
 
-JANUS authenticates to Microsoft Graph using a User-Assigned Managed Identity. There are no:
-- Client secrets stored in the application
-- Certificates stored in the application
-- Long-lived tokens in environment variables
-- Credentials in repository files
+## Runtime identity and Graph permission
 
-### 5. Input validation
+The Container App obtains a Microsoft Graph token from Azure managed identity.
+No runtime Graph client secret is stored.
 
-The `RegistrationPolicy` class enforces strict validation on every DCR request before any Entra call is made:
+Required application permission:
 
-| Field | Validation |
-|---|---|
-| `redirect_uris` | Must be present; each URI must match the configured allowlist; `https://` required for non-loopback |
-| `redirect_uri` schemes | Only `https://`, `http://localhost`, `http://127.0.0.1`, `http://[::1]`, and configured native schemes |
-| `grant_types` | Must be `["authorization_code"]` only |
-| `response_types` | Must be `["code"]` only |
-| `token_endpoint_auth_method` | Must be `"none"` |
-| `client_name` | Non-empty, ≤ 64 characters, safe character set (`[A-Za-z0-9 _\-\.]`) |
-| Redirect URI count | Maximum 10 (configurable) |
-| Field lengths | All string fields have maximum length limits |
-| Unexpected fields | Additional fields not in the allowed set are rejected |
-| Duplicate values | Arrays containing duplicate entries are rejected |
+| Permission | Why | Important limitation |
+|---|---|---|
+| `Application.ReadWrite.OwnedBy` | Create and manage applications owned by the JANUS runtime identity | It can list all tenant applications/service principals and can fully manage owned objects, including credentials; JANUS code must never exercise credential creation |
 
-### 6. Registration metadata tagging
+Microsoft's permission reference documents this scope and warns that
+credential-managing application permissions are sensitive:
+[Microsoft Graph permissions reference](https://learn.microsoft.com/graph/permissions-reference#applicationreadwriteownedby).
 
-Every JANUS-created registration is tagged to enable lifecycle management and auditing:
+The runtime identity must not receive `Application.ReadWrite.All`,
+`Directory.ReadWrite.All`, `AppRoleAssignment.ReadWrite.All`, delegated Graph
+permissions, or permission-grant authority.
 
-```json
-{
-  "tags": ["janus-managed", "janus-realm:<realm>"],
-  "notes": "Created by JANUS. Realm: <realm>. Created: <ISO8601>."
-}
-```
+Optional access to sign-in reports for lifecycle evidence is a separate design
+choice. It expands read authority and has licensing/retention dependencies; the
+safe default is to retain applications when that evidence is unavailable.
 
-The `Application.ReadWrite.OwnedBy` permission enforces ownership at the Graph API layer, preventing JANUS from modifying registrations it did not create.
+## Gateway validation
 
-### 7. No Keycloak-issued gateway tokens
+The gateway is outside JANUS and must use mature framework verification for:
 
-Keycloak in JANUS is used solely as a transport for the DCR endpoint. The JANUS configuration:
-- Does not configure Keycloak as an identity provider for the MCP gateway
-- Does not configure Keycloak to issue tokens that the MCP gateway trusts
-- Does not proxy authentication to the MCP gateway
-- Does not expose Keycloak's own authorization server to external consumers
+- exact Entra issuer and tenant;
+- expected audience;
+- allowed algorithms, signature and key rollover;
+- `nbf` and `exp` with bounded clock skew;
+- expected delegated-user versus app-only subject;
+- assignment requirement;
+- group admission, including Entra group-overage indicators;
+- gateway delegated scopes or application roles.
 
-### 8. Structured logging without secrets
+Tokens issued slightly in the future require an explicit skew policy. `iat`
+alone does not prevent replay. Missing or malformed authorization claims fail
+closed. A Graph overage fallback, if the gateway uses one, must be bounded and
+cached with a documented revocation window rather than called on every request.
 
-JANUS logs include:
-- `correlationId` — per-request UUID (generated by JANUS, not supplied by caller)
-- `operation` — DCR step name
-- `clientId` — Entra app ID after successful creation
-- `appObjectId` — Entra object ID
-- `outcome` — success / validation-failure / graph-error
-- `durationMs` — time taken
+## Logging
 
-JANUS never logs:
-- ******
-- Authorization headers from incoming requests
-- Client secrets (none are created, but the field is never logged)
-- Full JWT contents
-- Redirect URIs beyond what is necessary for debugging
+Logs use structured fields and correlation IDs. Safe operational identifiers
+include tenant/environment identifiers, Entra object/application IDs, policy
+decision codes, lifecycle reasons and Graph status categories.
 
-### 9. No token relay
+Never log access/refresh tokens, authorization codes, client credentials,
+managed-identity tokens, full JWTs, raw hostile metadata or upstream Graph
+response bodies.
 
-JANUS does not forward or relay the caller's bearer token (if any) to Microsoft Graph. Graph calls are authenticated using the Managed Identity, which is completely independent from the MCP client's credentials.
+## Lifecycle safety
 
-## Gateway security model
+Display names are never deletion evidence. Cleanup requires positive markers
+and Graph ownership, honors an explicit exclusion marker, defaults to dry-run,
+bounds each run, and rechecks immediately before deletion.
 
-The protected MCP gateway is operated independently from JANUS and must:
+Creation time is not last use. Entra sign-in reports are conditional evidence
+subject to licence, retention and latency and do not prove successful gateway
+access. Missing or ambiguous evidence is a retain decision.
 
-- Require user assignment to its Entra enterprise application
-- Validate every incoming token independently:
-  - Issuer: `https://login.microsoftonline.com/<tenant-id>/v2.0`
-  - Audience: gateway application client ID
-  - Signature: using Entra public keys from JWKS
-  - Lifetime: `exp` and `nbf`
-  - Tenant: reject unexpected tenant IDs
-  - Group membership or app roles as required
-- Perform authorization independently from registration
-- Not trust JANUS-issued claims (JANUS issues no claims)
+## CI/CD boundary
 
-### Authentication vs authorisation
+Pull requests receive read-only repository permissions and no Azure identity.
+Production deployment uses GitHub OIDC federation constrained to the repository
+and protected environment. Images are promoted by immutable digest. Long-lived
+Azure client secrets are forbidden.
 
-A JANUS-created app registration gives an MCP client a valid Entra OAuth identity. It does **not**:
-- Grant access to the MCP gateway
-- Assign roles or group memberships to the user
-- Confer any permissions beyond what Entra policies allow
+## Security verification status
 
-Gateway access requires the user to be:
-1. Authenticated with Entra credentials
-2. Assigned to the gateway enterprise application (user assignment required)
-3. Compliant with any Conditional Access policies
-
-## Threat mitigations summary
-
-| Threat | Mitigation |
-|---|---|
-| JANUS becomes token issuer | Architectural: JANUS has no token endpoint; Keycloak not used as gateway IdP |
-| Arbitrary redirect URI registration | RegistrationPolicy allowlist + Graph immutable redirect URI on registration |
-| Broad Entra write access | `Application.ReadWrite.OwnedBy` limits JANUS to owned registrations only |
-| Secret exposure via Graph | Public clients only; no secrets created |
-| Credential theft | Managed Identity; no stored credentials |
-| Malformed DCR injection | Input validation before any Graph call |
-| Stale registrations accumulate | Cleanup job with configurable retention |
-| Token logging | Explicit log field allowlist; tokens never included |
-
-See [threat-model.md](threat-model.md) for the full threat model.
+Unit and static tests prove local policy and payload contracts. They do not
+prove real Keycloak adapter selection, Graph/Entra behavior, MCP client issuer
+handoff, Conditional Access, gateway authorization, or lifecycle report
+availability. Those require explicit opt-in tests in a dedicated tenant.

@@ -3,14 +3,11 @@
 # Runs the CleanupJob main class using the bundled JANUS JAR.
 set -euo pipefail
 
-JAR_PATH="/opt/janus/janus.jar"
+JAR_PATH="/opt/janus/janus-cleanup.jar"
 
 if [ ! -f "$JAR_PATH" ]; then
-    echo "ERROR: JANUS JAR not found at $JAR_PATH" >&2
+    echo '{"operation":"cleanup_start","outcome":"failed","reason":"cleanup_jar_missing"}' >&2
     exit 1
 fi
 
-exec java \
-    -cp "$JAR_PATH" \
-    io.github.goldjg.janus.CleanupJob \
-    "$@"
+exec java -jar "$JAR_PATH" "$@"

@@ -1,116 +1,91 @@
-# JANUS App Registration Lifecycle
+# Application-registration lifecycle
 
-## Overview
+JANUS lifecycle decisions are intentionally conservative. A display name is
+never proof of ownership, and creation age alone is never proof that an
+application is inactive.
 
-JANUS creates Entra application registrations on behalf of MCP clients. These registrations represent OAuth client identities in the tenant. JANUS manages the lifecycle of these registrations to prevent accumulation of stale entries.
+## Ownership markers
 
-## Creation
+Each created application receives all of these tags:
 
-When a DCR request is successfully validated, JANUS creates an Entra application registration:
+- `janus-managed`
+- `janus-lifecycle:v1`
+- `janus-realm:<realm>`
+- `janus-tenant:<tenant-uuid>`
+- `janus-correlation:<request-uuid>` (operational reconciliation; not ownership by itself)
 
-```json
-{
-  "displayName": "janus-<realm>-<sanitised-client-name>-<uuid-prefix>",
-  "isFallbackPublicClient": true,
-  "publicClient": {
-    "redirectUris": ["<validated redirect URIs>"]
-  },
-  "signInAudience": "AzureADMyOrg",
-  "tags": ["janus-managed", "janus-realm:<realm>"],
-  "notes": "Created by JANUS. Realm: <realm>. Created: <ISO8601 UTC>."
-}
-```
+It is also created by the runtime managed identity using
+`Application.ReadWrite.OwnedBy`. Cleanup requires every marker to match the
+configured realm and tenant and requires valid immutable Graph object and
+client IDs. Naming and `notes` are operational context only.
 
-### Display name format
+Add `janus-cleanup:exclude` to manually retain a managed application.
 
-`janus-<realm>-<sanitised-client-name>-<uuid-prefix>`
+## What “last use” means
 
-- `<realm>` — Keycloak realm name (e.g. `janus`)
-- `<sanitised-client-name>` — client name from DCR request, lowercased, spaces replaced with hyphens, non-alphanumeric stripped
-- `<uuid-prefix>` — first 8 characters of a random UUID (collision avoidance)
+Entra application objects do not expose an authoritative `lastUsedAt` property.
+JANUS treats a suitable Entra sign-in record as evidence that the generated
+client participated in authentication or token issuance. That does not prove
+the token reached or was accepted by the MCP gateway.
 
-Example: `janus-janus-claude-code-a1b2c3d4`
+Sign-in reporting has permission, licensing, latency, and retention limits.
+If the reporting window does not cover the relevant period, “no record found”
+is not reliable evidence of no use. Group or gateway access logs answer
+different questions and must not be silently conflated.
 
-### Ownership
+The initial repository contains the deletion policy and job, but deliberately
+does not grant `AuditLog.Read.All` or pretend that a timestamp exists. A trusted
+observer must write exactly one fresh evidence set after complete coverage:
 
-`Application.ReadWrite.OwnedBy` causes JANUS's Managed Identity service principal to become the owner of each created registration. This prevents JANUS from reading or modifying registrations it did not create.
+- `janus-use-observed-through:<ISO-8601-instant>`
+- either `janus-last-observed-use:<ISO-8601-instant>` or
+  `janus-no-use-observed`
 
-## Tagging
+Until such an observer is deployed and reviewed, evidence is unavailable and
+every application is retained. This is the conservative fallback.
 
-All JANUS-created registrations carry the tags:
-- `janus-managed` — identifies JANUS-owned registrations for list queries
-- `janus-realm:<realm>` — identifies which JANUS realm created the registration
+## Decision algorithm
 
-Tags are used in Graph `$filter` queries by the cleanup job.
+At each scheduled run the job:
 
-## Deletion
+1. Lists applications filtered by the realm marker and follows validated,
+   bounded Graph pagination.
+2. Retains objects missing any positive ownership marker, valid identifiers,
+   or a trustworthy creation time.
+3. Retains manually excluded and recently created objects.
+4. Retains missing, duplicated, contradictory, stale, future-dated, or
+   out-of-range activity evidence.
+5. Marks an object as a candidate only when creation is older than retention,
+   evidence coverage is fresh, and last observed use is older than retention
+   or complete observation found no use.
+6. In dry-run, logs `would_delete` and changes nothing.
+7. In destructive mode, re-fetches by immutable Graph object ID, verifies the
+   client ID did not change, repeats the full decision, and applies the bounded
+   delete-attempt limit.
+8. Treats `404` as an idempotent already-absent result and reports other errors.
 
-### Cleanup job
+The default retention is 30 days, maximum evidence age is 48 hours, cleanup is
+dry-run, and one run attempts at most 20 deletions in the supplied Bicep.
 
-The cleanup Container Apps Job runs on a configurable schedule (default: daily at 02:00 UTC) and deletes JANUS-managed registrations that meet the deletion criteria.
+## Configuration
 
-### Deletion criteria
+| Variable | Default | Meaning |
+|---|---:|---|
+| `JANUS_TENANT_ID` | required | Tenant ownership boundary |
+| `JANUS_REALM` | required | Realm ownership boundary |
+| `JANUS_CLEANUP_RETENTION_DAYS` | `30` | Age since reliable last use / complete no-use evidence |
+| `JANUS_CLEANUP_DRY_RUN` | `true` | `false` is required for deletion |
+| `JANUS_CLEANUP_MAX_DELETE_COUNT` | `10` in code, `20` in Bicep | Per-run delete-attempt circuit breaker |
+| `JANUS_CLEANUP_EVIDENCE_MAX_AGE_HOURS` | `48` | Maximum age of observer coverage |
 
-A registration is eligible for deletion when:
-- It carries the `janus-managed` tag
-- Its creation time (from the `notes` field) is older than the configured retention period (default: 90 days)
+Every decision is emitted as structured JSON with correlation ID, object ID,
+client ID, outcome, reason, and non-sensitive detail. Tokens and sign-in record
+bodies are never logged.
 
-Retention period is configured via the `JANUS_CLEANUP_RETENTION_DAYS` environment variable.
+## Races and recovery
 
-### Cleanup audit log
-
-Each cleanup run logs:
-
-```json
-{
-  "operation": "cleanup",
-  "correlationId": "<uuid>",
-  "runAt": "<ISO8601>",
-  "realm": "<realm>",
-  "evaluated": 42,
-  "deleted": 3,
-  "errors": 0
-}
-```
-
-Each deletion logs:
-
-```json
-{
-  "operation": "cleanup.delete",
-  "correlationId": "<uuid>",
-  "objectId": "<Entra object ID>",
-  "appId": "<Entra app ID>",
-  "displayName": "<display name>",
-  "createdAt": "<ISO8601>",
-  "ageSeconds": 7776000
-}
-```
-
-## Manual deletion
-
-Administrators can delete JANUS-managed registrations manually via the Azure Portal or Azure CLI:
-
-```bash
-# List JANUS-managed registrations
-az ad app list --filter "tags/any(t:t eq 'janus-managed')" --query "[].{name:displayName, appId:appId}"
-
-# Delete by object ID
-az ad app delete --id <object-id>
-```
-
-## Registration count limits
-
-Entra tenants have limits on the number of application registrations. To avoid hitting these limits:
-
-1. The cleanup job deletes stale registrations automatically.
-2. Container Apps ingress rate limiting prevents registration floods.
-3. The default retention period (90 days) balances usability with tenant hygiene.
-
-Adjust `JANUS_CLEANUP_RETENTION_DAYS` based on your tenant limits and usage patterns.
-
-## No update path
-
-JANUS does not support updating an existing registration (e.g. to add redirect URIs). If an MCP client needs additional redirect URIs, it should submit a new DCR request. The old registration will be cleaned up after the retention period.
-
-This is intentional: update paths increase complexity and attack surface without clear operational benefit for the public client use case.
+List/evaluate/delete is inherently racy. Re-fetch and ID-continuity checks
+reduce risk but do not create a transaction with Entra. When uncertain, retain.
+Do not recreate a deleted application and assume its client ID, consent, or
+assignments can be recovered. See [operations.md](operations.md) before enabling
+destructive cleanup.

@@ -1,7 +1,5 @@
 package io.github.goldjg.janus;
 
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
@@ -14,236 +12,163 @@ import org.keycloak.services.clientregistration.ClientRegistrationProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.io.InputStream;
 import java.util.Map;
 import java.util.UUID;
 
-/**
- * Keycloak {@link ClientRegistrationProvider} that translates RFC 7591
- * Dynamic Client Registration requests into Microsoft Entra ID application
- * registrations via Microsoft Graph.
- *
- * <p><strong>Security invariant:</strong> This provider never issues, caches,
- * exchanges, or re-signs the bearer token used to access the protected MCP
- * gateway. Microsoft Entra ID remains the issuer of the gateway access token.
- *
- * <h2>Endpoint</h2>
- * {@code POST /realms/{realm}/clients-registrations/openid-connect}
- *
- * <h2>Supported operations</h2>
- * <ul>
- *   <li>POST (create): validates the DCR request and creates an Entra app
- *       registration</li>
- *   <li>GET, PUT, DELETE: not supported; returns 501 Not Implemented</li>
- * </ul>
- */
-public class JanusDCRProvider implements ClientRegistrationProvider {
-
+/** RFC 7591 adapter over JANUS's protocol-neutral Entra provisioning core. */
+public final class JanusDCRProvider implements ClientRegistrationProvider {
     private static final Logger log = LoggerFactory.getLogger(JanusDCRProvider.class);
 
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
-            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, true);
-
     private final KeycloakSession session;
+    private final InMemoryRegistrationControl control;
+    private final ProvisionerFactory provisioners;
     private ClientRegistrationAuth auth;
     private EventBuilder event;
 
     public JanusDCRProvider(KeycloakSession session) {
-        this.session = session;
+        this(session, JanusDCRProviderFactory.registrationControl(), GraphClientProvisioner::new);
     }
 
-    // ─── Setters/getters required by the SPI ─────────────────────────────
-
-    @Override
-    public void setAuth(ClientRegistrationAuth auth) {
-        // JANUS uses anonymous registration (public endpoint). Initial access
-        // tokens are not required but are supported if Keycloak is configured to
-        // enforce them for this realm. Stored for SPI contract compliance.
-        this.auth = auth;
+    JanusDCRProvider(KeycloakSession session, InMemoryRegistrationControl control,
+            ProvisionerFactory provisioners) {
+        this.session = java.util.Objects.requireNonNull(session, "session");
+        this.control = java.util.Objects.requireNonNull(control, "control");
+        this.provisioners = java.util.Objects.requireNonNull(provisioners, "provisioners");
     }
 
     @Override
-    public ClientRegistrationAuth getAuth() {
-        return auth;
-    }
-
+    public void setAuth(ClientRegistrationAuth auth) { this.auth = auth; }
     @Override
-    public void setEvent(EventBuilder event) {
-        // Stored for SPI contract compliance; JANUS does not record Keycloak
-        // events for registrations.
-        this.event = event;
-    }
-
+    public ClientRegistrationAuth getAuth() { return auth; }
     @Override
-    public EventBuilder getEvent() {
-        return event;
-    }
+    public void setEvent(EventBuilder event) { this.event = event; }
+    @Override
+    public EventBuilder getEvent() { return event; }
 
-    // ─── DCR endpoint ─────────────────────────────────────────────────────
-
-    /**
-     * Handle {@code POST /realms/{realm}/clients-registrations/openid-connect}.
-     *
-     * <p>Flow:
-     * <ol>
-     *   <li>Parse the RFC 7591 request body.</li>
-     *   <li>Validate using {@link RegistrationPolicy}.</li>
-     *   <li>Create an Entra app registration via {@link GraphClientService}.</li>
-     *   <li>Return the Entra {@code appId} in the DCR response.</li>
-     * </ol>
-     */
-    public Response create(UriInfo uriInfo, InputStream inputStream) {
+    /** POST /realms/{realm}/clients-registrations/openid-connect. */
+    public Response create(UriInfo ignored, InputStream inputStream) {
         String correlationId = UUID.randomUUID().toString();
         RealmModel realm = session.getContext().getRealm();
+        if (realm == null || realm.getName() == null || realm.getName().isBlank()) {
+            StructuredLog.error(log, "operation", "dcr_configuration_failure",
+                    "correlationId", correlationId, "reason", "missing_realm");
+            return errorResponse(503, "temporarily_unavailable",
+                    "JANUS is not configured for this realm", correlationId);
+        }
         String realmName = realm.getName();
 
-        log.debug("operation=dcr_create correlationId={} realm={}", correlationId, realmName);
-
-        // ── 1. Parse request ──────────────────────────────────────────────
-        DcrRequest request;
+        final JanusConfig config;
         try {
-            request = parseDcrRequest(inputStream, correlationId);
-        } catch (ParseException e) {
-            log.info("operation=dcr_parse_failure correlationId={} realm={} error={} description={}",
-                    correlationId, realmName, e.errorCode, e.errorDescription);
-            return errorResponse(400, e.errorCode, e.errorDescription);
+            config = JanusConfig.fromRealm(realm);
+        } catch (IllegalArgumentException e) {
+            StructuredLog.error(log, "operation", "dcr_configuration_failure",
+                    "correlationId", correlationId, "realm", realmName);
+            return errorResponse(503, "temporarily_unavailable",
+                    "JANUS registration policy is not configured", correlationId);
         }
 
-        // ── 2. Validate ───────────────────────────────────────────────────
-        JanusConfig config = JanusConfig.fromRealm(realm);
-        RegistrationPolicy policy = new RegistrationPolicy(config);
+        final DcrRequest request;
         try {
-            policy.validate(request);
+            request = new DcrRequestParser(config).parse(inputStream);
+        } catch (DcrRequestParser.DcrParseException e) {
+            StructuredLog.info(log, "operation", "dcr_parse_failure",
+                    "correlationId", correlationId, "realm", realmName);
+            return errorResponse(400, "invalid_client_metadata", e.getMessage(), correlationId);
+        }
+
+        final RegistrationAdmission.AdmissionTicket ticket;
+        try {
+            ticket = new KeycloakInitialAccessAdmission(session, this, auth).authorize(request);
+        } catch (RegistrationAdmissionException e) {
+            StructuredLog.info(log, "operation", "dcr_admission_denied",
+                    "correlationId", correlationId, "realm", realmName);
+            return errorResponse(401, "invalid_token", e.getMessage(), correlationId);
+        }
+
+        RegistrationService registration = new RegistrationService(config, control,
+                provisioners.create(config, correlationId));
+        final RegistrationOutcome outcome;
+        try {
+            outcome = registration.register(realmName, ticket.subjectKey(), correlationId, request);
         } catch (RegistrationPolicyViolationException e) {
-            log.info("operation=dcr_validation_failure correlationId={} realm={} error={} description={}",
-                    correlationId, realmName, e.getErrorCode(), e.getErrorDescription());
-            return errorResponse(400, e.getErrorCode(), e.getErrorDescription());
-        }
-
-        // ── 3. Create Entra app registration ──────────────────────────────
-        GraphClientService graphService = new GraphClientService(config, correlationId);
-        GraphClientService.CreatedApplication created;
-        try {
-            created = graphService.createApplication(realmName, request);
+            StructuredLog.info(log, "operation", "dcr_policy_denied",
+                    "correlationId", correlationId, "realm", realmName,
+                    "error", e.getErrorCode());
+            return errorResponse(400, e.getErrorCode(), e.getErrorDescription(), correlationId);
+        } catch (RegistrationLimitException e) {
+            StructuredLog.warn(log, "operation", "dcr_rate_limited",
+                    "correlationId", correlationId, "realm", realmName);
+            return Response.status(429).type(MediaType.APPLICATION_JSON)
+                    .header("Retry-After", "60")
+                    .header("X-Correlation-ID", correlationId)
+                    .entity(Map.of("error", "temporarily_unavailable", "error_description", e.getMessage()))
+                    .build();
         } catch (JanusRegistrationException e) {
-            log.error("operation=dcr_graph_error correlationId={} realm={} error={}",
-                    correlationId, realmName, e.getMessage());
+            StructuredLog.error(log, "operation", "dcr_provisioning_failure",
+                    "correlationId", correlationId, "realm", realmName);
+            return errorResponse(502, "server_error",
+                    "Entra application provisioning failed. Reference: " + correlationId,
+                    correlationId);
+        } catch (RuntimeException e) {
+            StructuredLog.error(log, "operation", "dcr_internal_failure",
+                    "correlationId", correlationId, "realm", realmName);
             return errorResponse(500, "server_error",
-                    "An internal error occurred. Reference: " + correlationId);
+                    "Registration failed. Reference: " + correlationId, correlationId);
         }
 
-        // ── 4. Return DCR response ────────────────────────────────────────
-        DcrResponse responseBody = new DcrResponse(created.appId(), created.displayName(), request);
+        if (!outcome.reused()) {
+            try {
+                ticket.consume();
+            } catch (RuntimeException e) {
+                // Provisioning succeeded but admission accounting did not. Fail closed and make
+                // the partial outcome visible through correlation logs; never create a second app.
+                StructuredLog.error(log, "operation", "dcr_admission_accounting_failure",
+                        "correlationId", correlationId, "realm", realmName,
+                        "clientId", outcome.client().clientId());
+                return errorResponse(500, "server_error",
+                        "Registration admission accounting failed. Reference: " + correlationId,
+                        correlationId);
+            }
+        }
 
-        log.info("operation=dcr_success correlationId={} realm={} clientId={}",
-                correlationId, realmName, created.appId());
-
-        return Response.status(201)
-                .type(MediaType.APPLICATION_JSON)
-                .entity(responseBody)
-                .build();
+        DcrResponse body = new DcrResponse(outcome.client().clientId(),
+                outcome.client().displayName(), request);
+        StructuredLog.info(log, "operation", "dcr_success", "correlationId", correlationId,
+                "realm", realmName, "tenantId", config.getTenantId(),
+                "clientId", outcome.client().clientId(), "idempotentReuse", outcome.reused());
+        return Response.status(201).type(MediaType.APPLICATION_JSON)
+                .header("X-Correlation-ID", correlationId).entity(body).build();
     }
 
-    // ─── Unsupported operations ───────────────────────────────────────────
-
-    /**
-     * GET /realms/{realm}/clients-registrations/openid-connect/{clientId}
-     * Not supported by JANUS.
-     */
-    public Response get(ClientModel client) {
-        return Response.status(501)
-                .type(MediaType.APPLICATION_JSON)
-                .entity(Map.of(
-                        "error", "not_supported",
-                        "error_description", "Client read is not supported by JANUS"))
-                .build();
+    public Response get(ClientModel ignored) {
+        return errorResponse(501, "not_supported", "Client read is not supported by JANUS");
     }
 
-    /**
-     * PUT /realms/{realm}/clients-registrations/openid-connect/{clientId}
-     * Not supported by JANUS. MCP clients should submit a new DCR request.
-     */
-    public Response update(String clientId, InputStream inputStream) {
-        return Response.status(501)
-                .type(MediaType.APPLICATION_JSON)
-                .entity(Map.of(
-                        "error", "not_supported",
-                        "error_description",
-                        "Client update is not supported by JANUS. "
-                                + "Submit a new registration request to obtain a new client_id."))
-                .build();
+    public Response update(String ignored, InputStream inputStream) {
+        return errorResponse(501, "not_supported", "Client update is not supported by JANUS");
     }
 
-    /**
-     * DELETE /realms/{realm}/clients-registrations/openid-connect/{clientId}
-     * Not supported by JANUS. Stale registrations are cleaned up by the
-     * lifecycle cleanup job.
-     */
-    public Response delete(String clientId) {
-        return Response.status(501)
-                .type(MediaType.APPLICATION_JSON)
-                .entity(Map.of(
-                        "error", "not_supported",
-                        "error_description",
-                        "Client deletion is not supported via this endpoint. "
-                                + "Stale registrations are removed by the JANUS cleanup job."))
-                .build();
+    public Response delete(String ignored) {
+        return errorResponse(501, "not_supported", "Client deletion is not supported by JANUS");
     }
 
     @Override
-    public void close() {
-        // No resources to release.
-    }
-
-    // ─── Helpers ──────────────────────────────────────────────────────────
-
-    private DcrRequest parseDcrRequest(InputStream inputStream, String correlationId) {
-        if (inputStream == null) {
-            return errorBadRequest("Request body is required");
-        }
-        try {
-            DcrRequest request = OBJECT_MAPPER.readValue(inputStream, DcrRequest.class);
-            if (request == null) {
-                return errorBadRequest("Request body must not be empty");
-            }
-            return request;
-        } catch (IOException e) {
-            log.info("operation=dcr_parse_failure correlationId={} error={}",
-                    correlationId, e.getMessage());
-            // Use a checked-exception trampoline to keep the signature clean.
-            throw new ParseException("invalid_client_metadata",
-                    "Request body is not valid JSON or contains unexpected fields");
-        }
-    }
-
-    /**
-     * Throws a {@link ParseException} to signal a 400 response for a bad request.
-     * This method always throws and never returns a value.
-     */
-    private static <T> T errorBadRequest(String description) {
-        throw new ParseException("invalid_client_metadata", description);
-    }
+    public void close() { }
 
     private static Response errorResponse(int status, String error, String description) {
-        return Response.status(status)
-                .type(MediaType.APPLICATION_JSON)
-                .entity(Map.of("error", error, "error_description", description))
-                .build();
+        return errorResponse(status, error, description, UUID.randomUUID().toString());
     }
 
-    /**
-     * Internal exception used to signal a parse error before the try-catch
-     * boundary in {@link #create}.
-     */
-    private static class ParseException extends RuntimeException {
-        final String errorCode;
-        final String errorDescription;
+    private static Response errorResponse(
+            int status, String error, String description, String correlationId) {
+        return Response.status(status).type(MediaType.APPLICATION_JSON)
+                .header("X-Correlation-ID", correlationId)
+                .entity(Map.of("error", error, "error_description", description)).build();
+    }
 
-        ParseException(String errorCode, String errorDescription) {
-            super(errorCode + ": " + errorDescription);
-            this.errorCode = errorCode;
-            this.errorDescription = errorDescription;
-        }
+    @FunctionalInterface
+    interface ProvisionerFactory {
+        ClientProvisioner create(JanusConfig config, String correlationId);
     }
 }

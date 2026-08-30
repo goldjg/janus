@@ -1,170 +1,161 @@
-# JANUS Architecture
+# Architecture
 
-## Overview
+## Purpose
 
-JANUS is a narrow interoperability adapter. It exposes an [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591) Dynamic Client Registration (DCR) endpoint to MCP clients, then translates each DCR request into a real Microsoft Entra ID application registration via Microsoft Graph. Once registration is complete, JANUS steps out of the authentication path entirely.
+JANUS translates an admitted legacy MCP Dynamic Client Registration request
+into a constrained Microsoft Entra public-client application registration. It
+then exits the flow. Microsoft Entra ID performs authentication and issues the
+gateway token; the gateway performs authorization.
 
-## Component diagram
+```text
+Registration plane
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                          MCP Client                                │
-│  (Claude Code, Cursor, custom agent, or any RFC 7591 DCR client)  │
-└───────────────────────────────┬────────────────────────────────────┘
-                                │  (1) POST DCR request
-                                ▼
-┌────────────────────────────────────────────────────────────────────┐
-│                     Azure Container Apps                           │
-│                                                                    │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  Keycloak (quay.io/keycloak/keycloak)                       │  │
-│  │                                                             │  │
-│  │  /realms/janus/clients-registrations/openid-connect         │  │
-│  │       │                                                     │  │
-│  │       ▼                                                     │  │
-│  │  JanusDCRProvider (janus-dcr-provider.jar)                  │  │
-│  │       │                                                     │  │
-│  │       ├──► RegistrationPolicy.validate()                   │  │
-│  │       │      redirect URIs, grant types, scopes,           │  │
-│  │       │      client name, auth method, field limits        │  │
-│  │       │                                                     │  │
-│  │       └──► GraphClientService.createApplication()          │  │
-│  │              Managed Identity credential                   │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-│  User-Assigned Managed Identity                                    │
-└───────────────────────────────┬────────────────────────────────────┘
-                                │  (3) POST /v1.0/applications
-                                │      Application.ReadWrite.OwnedBy
-                                ▼
-┌────────────────────────────────────────────────────────────────────┐
-│                     Microsoft Entra ID                             │
-│                                                                    │
-│  Creates public client app registration:                          │
-│  - isFallbackPublicClient: true                                   │
-│  - no client secrets / certificates                               │
-│  - redirect URIs from policy allowlist                            │
-│  - JANUS ownership tags                                           │
-│                                                                    │
-│  (4) Returns appId (client_id)                                    │
-└───────────────────────────────┬────────────────────────────────────┘
-                                │  (4) client_id in DCR response
-                                ▼
-                          MCP Client
+MCP client -- DCR --> JANUS/Keycloak adapter --> policy + provisioning core
+                                                       |
+                                                       | managed identity
+                                                       v
+                                                Microsoft Graph
+                                                       |
+                                                       v
+                                             Entra app registration
 
-  ─────── JANUS is now out of the authentication path ───────
+Authentication and access plane (JANUS absent)
 
-  (5) MCP client → Entra: authorization request (auth code + PKCE)
-  (6) Entra → MCP client: authorization code
-  (7) MCP client → Entra: token request
-  (8) Entra → MCP client: access token (Entra-issued, Entra-signed)
-  (9) MCP client → MCP gateway: API call with Entra bearer token
-  (10) MCP gateway validates token (issuer, aud, sig, exp) independently
+MCP client -- authorization code + PKCE --> Microsoft Entra ID
+MCP client <-- Entra access token ---------- Microsoft Entra ID
+MCP client -- Entra access token ----------> MCP gateway --> MCP server/tools
+                                              issuer, tenant, audience,
+                                              signature, time, assignment,
+                                              group and scope/role checks
 ```
 
-## Separation of concerns
+## Component boundaries
 
-| Concern | Component | Notes |
-|---|---|---|
-| DCR protocol surface | Keycloak + JanusDCRProvider | Keycloak provides the OIDC-conformant endpoint and session model |
-| Registration policy | RegistrationPolicy | Pure validation; no side effects |
-| Entra integration | GraphClientService | One outbound call per registration |
-| Authentication | Microsoft Entra ID | No JANUS involvement after DCR |
-| Token issuance | Microsoft Entra ID | JANUS never touches tokens |
-| Gateway authorisation | MCP gateway | Independent of JANUS |
-| App registration cleanup | Cleanup Container Apps Job | Scheduled; uses same managed identity |
+### DCR adapter
 
-## Data flows
+The Keycloak SPI owns RFC 7591 parsing, request-size enforcement, admission,
+protocol error mapping and response serialization. It converts only accepted
+metadata into a normalized provisioning request.
 
-### Registration flow (DCR)
+Client registration is an internal Keycloak SPI. The image therefore pins a
+tested Keycloak version and digest; every Keycloak upgrade requires compilation,
+provider-discovery, protocol, and container smoke tests. This maintenance
+coupling stays inside the legacy DCR adapter rather than the provisioning core.
 
-```
-MCP Client
-  │  POST /realms/janus/clients-registrations/openid-connect
-  │  Body: { client_name, redirect_uris, grant_types, … }
-  ▼
-Keycloak routes to JanusDCRProvider.create()
-  │
-  ├─ RegistrationPolicy.validate(request)
-  │    Returns 400 if invalid
-  │
-  └─ GraphClientService.createApplication(clientName, redirectUris)
-       │
-       │  POST https://graph.microsoft.com/v1.0/applications
-       │  Authorization: ******
-       │  Body: {
-       │    displayName: "janus-<realm>-<sanitised-name>-<uuid>",
-       │    isFallbackPublicClient: true,
-       │    publicClient: { redirectUris: [...] },
-       │    tags: ["janus-managed", "janus-realm:<realm>"],
-       │    notes: "Created by JANUS. Realm: <realm>. Created: <ISO8601>."
-       │  }
-       ▼
-  Entra returns appId
-  │
-  └─ JanusDCRProvider returns DCR response:
-       { client_id: <appId>, client_name: <displayName>, … }
-```
+Keycloak is not the gateway issuer. A client must be configured or discovered
+to use the Entra issuer after registration. This handoff requires explicit
+per-client integration evidence; registering through a Keycloak URL does not by
+itself prove the client will authorize against Entra.
 
-### Cleanup flow
+### Registration policy
 
-```
-Container Apps Job (schedule: cron)
-  │
-  └─ GraphClientService.listJanusApplications(realm)
-       GET /v1.0/applications?$filter=tags/any(t:t eq 'janus-managed')
-       │
-       ├─ For each app older than retention period:
-       │    DELETE /v1.0/applications/<objectId>
-       │
-       └─ Log each deletion (correlationId, objectId, appId, age)
-```
+Policy binds a request to one configured tenant and gateway resource. It
+accepts only public authorization-code clients, explicitly approved redirect
+URIs and gateway delegated scopes. It rejects unknown, oversized, duplicate or
+unsupported metadata before any Graph call.
 
-## Deployment topology
+Admission and creation limits protect the tenant object quota. Edge rate
+limiting or IP restriction complements but does not replace application-level
+admission.
 
-```
-Azure Resource Group
-  │
-  ├── User-Assigned Managed Identity
-  │     └── Graph app role: Application.ReadWrite.OwnedBy
-  │
-  ├── Azure Container Registry
-  │     └── Image: janus-keycloak:<tag>
-  │
-  ├── Container Apps Environment
-  │     ├── Container App: keycloak
-  │     │     - Image: janus-keycloak:<tag>
-  │     │     - Ingress: HTTPS external
-  │     │     - Identity: user-assigned managed identity
-  │     │     - Env: JANUS_TENANT_ID, JANUS_GATEWAY_RESOURCE_URI, …
-  │     │
-  │     └── Container App Job: janus-cleanup
-  │           - Image: janus-keycloak:<tag>  (reuses same image, different entrypoint)
-  │           - Schedule: 0 2 * * *  (daily at 02:00 UTC)
-  │           - Identity: user-assigned managed identity
-  │
-  └── Azure Monitor / Log Analytics Workspace
-```
+### Provisioning core
 
-## Security architecture
+The core accepts a protocol-neutral, already normalized request. Its interface
+is the future attachment point for a CIMD adapter. It returns the Entra client
+ID and safe operational metadata; it does not return a client credential or
+grant gateway access.
 
-See [security-model.md](security-model.md) and [threat-model.md](threat-model.md).
+### Microsoft Graph transport
 
-## Trust boundaries
+The transport uses the Container App's user-assigned managed identity and a
+fixed Microsoft Graph origin. It creates single-tenant applications with
+public-client redirect URIs, approved gateway `requiredResourceAccess`, and
+explicit JANUS ownership/lifecycle markers. It never creates password or key
+credentials and never grants consent or assignments.
 
-| Boundary | Crossing point | Controls |
-|---|---|---|
-| Internet → Keycloak DCR endpoint | Container Apps ingress | TLS termination, rate limiting |
-| DCR input → JANUS policy | RegistrationPolicy | Input validation, allowlists, field limits |
-| JANUS → Microsoft Graph | Managed Identity + TLS | `Application.ReadWrite.OwnedBy` only; no user-delegated permissions |
-| MCP client → Entra | Direct; JANUS not involved | Standard Entra CA/MFA/device policies |
-| MCP client → MCP gateway | Direct; JANUS not involved | Gateway validates Entra token independently |
+The runtime permission is `Application.ReadWrite.OwnedBy`. Microsoft documents
+that this permission can create and fully manage applications the caller owns,
+while also allowing tenant-wide listing of applications and service principals.
+JANUS must therefore continue to filter and positively identify its own
+objects; the permission is not a substitute for application-level checks.
 
-## Key design constraints
+### Lifecycle cleanup
 
-1. **JANUS does not issue access tokens.** Never. The JANUS security invariant is absolute.
-2. **Public clients only.** JANUS-created registrations never have client secrets or certificates.
-3. **Owned registrations only.** `Application.ReadWrite.OwnedBy` constrains JANUS to only manage registrations it created.
-4. **No user context.** JANUS operates with application identity (Managed Identity), never with a user context.
-5. **Keycloak is a transport, not an authority.** Keycloak provides the DCR endpoint surface; JANUS controls policy and Entra integration. Keycloak's own client registry is not used for gateway access.
-6. **Single-tenant by default.** Multi-tenant is not supported without explicit design justification and documentation.
+The scheduled Container Apps Job shares the Graph transport but has a separate
+decision policy. It is dry-run-first, positively identifies ownership, honors
+manual exclusions, bounds deletions and retains on uncertain activity evidence.
+See `docs/lifecycle.md` and ADR 0002.
+
+### Gateway boundary
+
+The gateway is intentionally not implemented by JANUS. It validates mature
+framework output rather than using bespoke crypto, and independently enforces:
+
+- exact Entra issuer and permitted tenant;
+- gateway audience;
+- signature and key lifecycle;
+- `nbf`, `exp` and acceptable clock skew;
+- expected user or workload subject type;
+- required assignment and groups, including group overage handling;
+- required delegated scope or app role.
+
+`iat` is informational and policy-relevant but is not replay prevention.
+
+## Azure deployment
+
+The deployment uses Azure Container Apps, a user-assigned managed identity,
+Azure Container Registry, Log Analytics and a scheduled Container Apps Job.
+Production Keycloak state uses an external persistent database rather than
+container-local development storage.
+
+GitHub Actions authenticates with an Entra federated credential and deploys an
+immutable image through a protected GitHub Environment. Pull-request validation
+has no Azure credentials.
+
+Public DCR ingress requires explicit admission. Operators should also restrict
+source CIDRs or place a rate-limiting edge such as Azure Front Door WAF in front
+of the Container App. Container replica scaling is not rate limiting.
+
+## Optional agentgateway integration
+
+Agentgateway can act as an MCP resource server, publish protected-resource
+metadata, validate JWTs and apply route authorization/rate policy. Its current
+native Entra provider is architecturally relevant because it keeps Entra as the
+issuer, but it expects a configured client ID and does not by itself replace
+JANUS's dynamic Entra provisioning contract.
+
+Agentgateway's Keycloak provider is not suitable for the JANUS access plane: it
+uses Keycloak as the authorization server and validates Keycloak-issued tokens,
+which violates JANUS's issuer invariant. A future integration must use the
+native Entra validation path and isolate any JANUS DCR routing as registration
+only. Agentgateway is therefore optional and not part of the initial runtime.
+
+Reference: [agentgateway MCP authentication](https://agentgateway.dev/docs/standalone/latest/configuration/security/mcp-authn/).
+
+## State and identifiers
+
+- Entra application object ID: Graph lifecycle target; never exposed as a
+  credential.
+- Entra application/client ID: returned by DCR and used by the MCP client.
+- Display name: operational aid only; never ownership or deletion evidence.
+- Tags/notes: explicit JANUS marker, environment/realm marker, lifecycle schema
+  and optional cleanup exclusion.
+- Correlation ID: joins sanitized registration and Graph outcomes.
+
+JANUS does not maintain an application database merely to appear stateful.
+State required for admission/idempotency must have explicit consistency and
+replica semantics.
+
+## Failure behavior
+
+- Invalid or unadmitted requests fail before Graph.
+- Missing critical configuration fails closed.
+- Graph failures return a correlation reference without upstream bodies/tokens.
+- Ambiguous cleanup evidence retains the application.
+- A JANUS outage blocks new registration but does not interrupt existing Entra
+  authentication or gateway authorization.
+
+## Architecture decisions
+
+- [ADR 0001: registration plane and issuer handoff](adr/0001-registration-plane-and-issuer-handoff.md)
+- [ADR 0002: conservative lifecycle evidence](adr/0002-conservative-lifecycle-evidence.md)

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "selected": [
+    "cloud/azure",
+    "cloud/entra",
+    "cloud/microsoft-graph",
+    "core/baseline",
+    "core/carl",
+    "core/cognition-governance",
+    "core/dependency",
+    "core/identity",
+    "core/memory-cache",
+    "core/pr-contract",
+    "core/security",
+    "core/tool-permission-tiers",
+    "languages/java",
+    "languages/powershell",
+    "platform/cicd",
+    "platform/docker"
+  ]
+}

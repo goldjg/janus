@@ -1,133 +1,371 @@
-name: Build and Deploy JANUS
+name: Validate, Build, and Deploy JANUS
 
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - 'v*'
   pull_request:
-    branches:
-      - main
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Protected GitHub Environment used for Azure federation
+        required: true
+        default: production
+        type: environment
+      deploy:
+        description: Build, publish, and deploy after validation
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: janus-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
-  packages: write  # For pushing to GHCR if used instead of ACR
+
+env:
+  JAVA_VERSION: '17'
+  IMAGE_REPOSITORY: janus-keycloak
 
 jobs:
-  # ─── Build and Test ────────────────────────────────────────────────────────
-  build:
-    name: Build and Test
-    runs-on: ubuntu-latest
-
+  validate:
+    name: Test and static validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Set up Java 17
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00  # v4.7.1
+      - name: Set up Java
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
         with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: 'maven'
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
 
-      - name: Build and test Keycloak extension
-        run: mvn clean verify -B
+      - name: Compile and test JANUS
         working-directory: janus
+        run: mvn -B --no-transfer-progress clean verify
 
-      - name: Upload test results
+      - name: Check Maven dependency declarations
+        working-directory: janus
+        run: >-
+          mvn -B --no-transfer-progress -DskipTests
+          org.apache.maven.plugins:maven-dependency-plugin:3.8.1:analyze-only
+          -DfailOnWarning=true
+
+      - name: Validate PowerShell bootstrap safety assertions
+        shell: pwsh
+        run: ./bootstrap/Test-BootstrapStatic.ps1
+
+      - name: Build and lint Bicep
+        shell: bash
+        run: |
+          set -euo pipefail
+          az bicep build --file infra/main.bicep --stdout >/dev/null
+
+      - name: Reject credential-based registry login
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R -E 'ACR_CLIENT_SECRET|AZURE_CLIENT_SECRET|password:.*ACR' \
+               --exclude='build.yml' .github/workflows; then
+            echo 'Long-lived Azure/ACR credentials are forbidden; use GitHub OIDC.' >&2
+            exit 1
+          fi
+
+      - name: Upload unit-test reports
         if: always()
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
-          name: test-results
+          name: unit-test-reports-${{ github.run_id }}
           path: janus/target/surefire-reports/
+          if-no-files-found: warn
+          retention-days: 14
 
-      - name: Upload extension JAR
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
-        with:
-          name: janus-extension-jar
-          path: janus/target/janus-dcr-provider-*.jar
-
-  # ─── Container image build ─────────────────────────────────────────────────
   build-image:
-    name: Build Container Image
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name != 'pull_request'
-
+    name: Build, scan, and publish immutable image
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy)
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}
+    permissions:
+      contents: read
+      id-token: write
     outputs:
-      image-tag: ${{ steps.meta.outputs.version }}
-
+      image-reference: ${{ steps.publish.outputs.image_reference }}
+      image-digest: ${{ steps.publish.outputs.image_digest }}
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Download extension JAR
-        uses: actions/download-artifact@cc203385981b70ca67e1cc392babde5e1e7a9a3  # v4.1.9
+      - name: Validate required deployment variables
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_DEPLOYMENT_CLIENT_ID: ${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: |
+          set -euo pipefail
+          uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          for name in AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_DEPLOYMENT_CLIENT_ID ACR_NAME; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required GitHub variable: $name" >&2
+              exit 1
+            fi
+          done
+          [[ "$AZURE_TENANT_ID" =~ $uuid_re ]] || { echo 'Invalid AZURE_TENANT_ID' >&2; exit 1; }
+          [[ "$AZURE_SUBSCRIPTION_ID" =~ $uuid_re ]] || { echo 'Invalid AZURE_SUBSCRIPTION_ID' >&2; exit 1; }
+          [[ "$AZURE_DEPLOYMENT_CLIENT_ID" =~ $uuid_re ]] || { echo 'Invalid AZURE_DEPLOYMENT_CLIENT_ID' >&2; exit 1; }
+          [[ "$ACR_NAME" =~ ^[a-zA-Z0-9]{5,50}$ ]] || { echo 'Invalid ACR_NAME' >&2; exit 1; }
+
+      - name: Authenticate to Azure with GitHub OIDC
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04abe2e7b45 # v2.3.0
         with:
-          name: janus-extension-jar
-          path: janus/target/
+          client-id: ${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Log in to Azure Container Registry
-        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
-        with:
-          registry: ${{ secrets.ACR_NAME }}.azurecr.io
-          username: ${{ secrets.ACR_CLIENT_ID }}
-          password: ${{ secrets.ACR_CLIENT_SECRET }}
+      - name: Validate active Azure context and log in to ACR
+        shell: bash
+        env:
+          EXPECTED_TENANT: ${{ vars.AZURE_TENANT_ID }}
+          EXPECTED_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: |
+          set -euo pipefail
+          actual_tenant=$(az account show --query tenantId --output tsv)
+          actual_subscription=$(az account show --query id --output tsv)
+          [[ "$actual_tenant" == "$EXPECTED_TENANT" ]] || { echo 'Azure tenant mismatch' >&2; exit 1; }
+          [[ "$actual_subscription" == "$EXPECTED_SUBSCRIPTION" ]] || { echo 'Azure subscription mismatch' >&2; exit 1; }
+          az acr login --name "$ACR_NAME" --only-show-errors
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@902fa8ec7d6ecbea8a63c0ed1a7cdf8e3b57d2a6  # v5.7.0
-        with:
-          images: ${{ secrets.ACR_NAME }}.azurecr.io/janus-keycloak
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
-      - name: Build and push container image
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6.18.0
+      - name: Build local image for security scan
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: janus
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ vars.ACR_NAME }}.azurecr.io/janus-keycloak:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ─── Deploy ────────────────────────────────────────────────────────────────
-  deploy:
-    name: Deploy to Azure
-    runs-on: ubuntu-latest
-    needs: build-image
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-    environment: production
+      - name: Scan image for high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ vars.ACR_NAME }}.azurecr.io/janus-keycloak:sha-${{ github.sha }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          trivyignores: .trivyignore.yaml
 
+      - name: Publish image with provenance and SBOM
+        id: publish_image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: janus
+          push: true
+          platforms: linux/amd64
+          tags: ${{ vars.ACR_NAME }}.azurecr.io/janus-keycloak:sha-${{ github.sha }}
+          cache-from: type=gha
+          provenance: mode=max
+          sbom: true
+
+      - name: Resolve immutable image reference
+        id: publish
+        shell: bash
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+          IMAGE_TAG: sha-${{ github.sha }}
+          BUILD_DIGEST: ${{ steps.publish_image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          tagged_image="$ACR_NAME.azurecr.io/$IMAGE_REPOSITORY:$IMAGE_TAG"
+          digest=$(az acr repository show \
+            --name "$ACR_NAME" \
+            --image "$IMAGE_REPOSITORY:$IMAGE_TAG" \
+            --query digest --output tsv --only-show-errors)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'ACR returned an invalid image digest' >&2; exit 1; }
+          [[ "$digest" == "$BUILD_DIGEST" ]] || { echo 'Published image digest does not match build output' >&2; exit 1; }
+          echo "image_digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image_reference=$ACR_NAME.azurecr.io/$IMAGE_REPOSITORY@$digest" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy immutable image to Azure
+    needs: [validate, build-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Log in to Azure
-        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04abe2e7b45  # v2.3.0
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Validate deployment configuration
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_DEPLOYMENT_CLIENT_ID: ${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          JANUS_ENVIRONMENT_NAME: ${{ vars.JANUS_ENVIRONMENT_NAME }}
+          JANUS_GATEWAY_CLIENT_ID: ${{ vars.JANUS_GATEWAY_CLIENT_ID }}
+          JANUS_GATEWAY_RESOURCE_URI: ${{ vars.JANUS_GATEWAY_RESOURCE_URI }}
+          JANUS_ALLOWED_GATEWAY_SCOPES: ${{ vars.JANUS_ALLOWED_GATEWAY_SCOPES }}
+          JANUS_RUNTIME_MI_CLIENT_ID: ${{ vars.JANUS_RUNTIME_MI_CLIENT_ID }}
+          JANUS_RUNTIME_MI_RESOURCE_ID: ${{ vars.JANUS_RUNTIME_MI_RESOURCE_ID }}
+          ACR_NAME: ${{ vars.ACR_NAME }}
+          KEYCLOAK_ADMIN_PASSWORD: ${{ secrets.KEYCLOAK_ADMIN_PASSWORD }}
+          KEYCLOAK_POSTGRES_PASSWORD: ${{ secrets.KEYCLOAK_POSTGRES_PASSWORD }}
+        run: |
+          set -euo pipefail
+          uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          required=(AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_DEPLOYMENT_CLIENT_ID AZURE_RESOURCE_GROUP AZURE_LOCATION JANUS_ENVIRONMENT_NAME JANUS_GATEWAY_CLIENT_ID JANUS_GATEWAY_RESOURCE_URI JANUS_ALLOWED_GATEWAY_SCOPES JANUS_RUNTIME_MI_CLIENT_ID JANUS_RUNTIME_MI_RESOURCE_ID ACR_NAME KEYCLOAK_ADMIN_PASSWORD KEYCLOAK_POSTGRES_PASSWORD)
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then echo "Missing required protected Environment value: $name" >&2; exit 1; fi
+          done
+          [[ "$JANUS_ENVIRONMENT_NAME" =~ ^[a-z0-9-]{3,20}$ ]] || { echo 'Invalid JANUS_ENVIRONMENT_NAME' >&2; exit 1; }
+          for name in AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_DEPLOYMENT_CLIENT_ID JANUS_GATEWAY_CLIENT_ID JANUS_RUNTIME_MI_CLIENT_ID; do
+            [[ "${!name}" =~ $uuid_re ]] || { echo "Invalid UUID in $name" >&2; exit 1; }
+          done
+          [[ "$JANUS_RUNTIME_MI_RESOURCE_ID" =~ ^/subscriptions/[0-9a-fA-F-]+/resourceGroups/[^/]+/providers/Microsoft.ManagedIdentity/userAssignedIdentities/[^/]+$ ]] || { echo 'Invalid JANUS_RUNTIME_MI_RESOURCE_ID' >&2; exit 1; }
+          [[ "$JANUS_GATEWAY_RESOURCE_URI" == api://* ]] || { echo 'JANUS_GATEWAY_RESOURCE_URI must start with api://' >&2; exit 1; }
+          [[ "$JANUS_ALLOWED_GATEWAY_SCOPES" == *=* ]] || { echo 'JANUS_ALLOWED_GATEWAY_SCOPES must contain scope-uri=permission-uuid mappings' >&2; exit 1; }
 
-      - name: Deploy Bicep
-        uses: azure/arm-deploy@a1361c2781ae0a9b0e3a6c35b97ec86b62edf956  # v2.0.0
+      - name: Authenticate to Azure with GitHub OIDC
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04abe2e7b45 # v2.3.0
         with:
-          resourceGroupName: ${{ secrets.AZURE_RESOURCE_GROUP }}
-          template: infra/main.bicep
-          parameters: >
-            baseName=${{ secrets.JANUS_BASE_NAME }}
-            tenantId=${{ secrets.AZURE_TENANT_ID }}
-            gatewayResourceUri=${{ secrets.JANUS_GATEWAY_RESOURCE_URI }}
-            acrName=${{ secrets.ACR_NAME }}
-            imageTag=${{ needs.build-image.outputs.image-tag }}
-            keycloakAdminPassword=${{ secrets.KEYCLOAK_ADMIN_PASSWORD }}
-            managedIdentityClientId=${{ secrets.JANUS_MI_CLIENT_ID }}
-            managedIdentityResourceId=${{ secrets.JANUS_MI_RESOURCE_ID }}
-          deploymentName: janus-${{ github.run_number }}
-          failOnStdErr: true
+          client-id: ${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate active tenant and subscription
+        shell: bash
+        env:
+          EXPECTED_TENANT: ${{ vars.AZURE_TENANT_ID }}
+          EXPECTED_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          [[ "$(az account show --query tenantId -o tsv)" == "$EXPECTED_TENANT" ]] || { echo 'Azure tenant mismatch' >&2; exit 1; }
+          [[ "$(az account show --query id -o tsv)" == "$EXPECTED_SUBSCRIPTION" ]] || { echo 'Azure subscription mismatch' >&2; exit 1; }
+
+      - name: Deploy infrastructure, Container App, and cleanup job
+        id: deploy
+        shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ needs.build-image.outputs.image-reference }}
+          KEYCLOAK_ADMIN_PASSWORD: ${{ secrets.KEYCLOAK_ADMIN_PASSWORD }}
+          KEYCLOAK_POSTGRES_PASSWORD: ${{ secrets.KEYCLOAK_POSTGRES_PASSWORD }}
+          CLEANUP_RETENTION_DAYS: ${{ vars.JANUS_CLEANUP_RETENTION_DAYS || '30' }}
+          CLEANUP_DRY_RUN: ${{ vars.JANUS_CLEANUP_DRY_RUN || 'true' }}
+          EXTERNAL_INGRESS_ENABLED: ${{ vars.JANUS_EXTERNAL_INGRESS_ENABLED || 'false' }}
+          ALLOWED_REDIRECT_PATTERNS: ${{ vars.JANUS_ALLOWED_REDIRECT_PATTERNS || 'http://localhost:{port}/*,http://127.0.0.1:{port}/*,http://[::1]:{port}/*' }}
+          EXISTING_CONTAINER_APPS_SUBNET_ID: ${{ vars.JANUS_EXISTING_CONTAINER_APPS_SUBNET_ID }}
+          EXISTING_POSTGRES_SUBNET_ID: ${{ vars.JANUS_EXISTING_POSTGRES_SUBNET_ID }}
+          EXISTING_POSTGRES_PRIVATE_DNS_ZONE_ID: ${{ vars.JANUS_EXISTING_POSTGRES_PRIVATE_DNS_ZONE_ID }}
+        run: |
+          set -euo pipefail
+          use_existing_network=false
+          if [[ -n "$EXISTING_CONTAINER_APPS_SUBNET_ID" || -n "$EXISTING_POSTGRES_SUBNET_ID" || -n "$EXISTING_POSTGRES_PRIVATE_DNS_ZONE_ID" ]]; then
+            if [[ -z "$EXISTING_CONTAINER_APPS_SUBNET_ID" || -z "$EXISTING_POSTGRES_SUBNET_ID" || -z "$EXISTING_POSTGRES_PRIVATE_DNS_ZONE_ID" ]]; then
+              echo 'All three existing network resource IDs must be configured together.' >&2
+              exit 1
+            fi
+            use_existing_network=true
+          fi
+          [[ "$CLEANUP_DRY_RUN" == 'true' || "$CLEANUP_DRY_RUN" == 'false' ]] || { echo 'JANUS_CLEANUP_DRY_RUN must be true or false' >&2; exit 1; }
+          [[ "$EXTERNAL_INGRESS_ENABLED" == 'true' || "$EXTERNAL_INGRESS_ENABLED" == 'false' ]] || { echo 'JANUS_EXTERNAL_INGRESS_ENABLED must be true or false' >&2; exit 1; }
+
+          deployment_name="janus-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          outputs=$(az deployment group create \
+            --name "$deployment_name" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
+            --template-file infra/main.bicep \
+            --parameters \
+              location="${{ vars.AZURE_LOCATION }}" \
+              environmentName="${{ vars.JANUS_ENVIRONMENT_NAME }}" \
+              tenantId="${{ vars.AZURE_TENANT_ID }}" \
+              gatewayApplicationClientId="${{ vars.JANUS_GATEWAY_CLIENT_ID }}" \
+              gatewayResourceUri="${{ vars.JANUS_GATEWAY_RESOURCE_URI }}" \
+              allowedGatewayScopesCsv="${{ vars.JANUS_ALLOWED_GATEWAY_SCOPES }}" \
+              acrName="${{ vars.ACR_NAME }}" \
+              containerImage="$IMAGE_REFERENCE" \
+              managedIdentityClientId="${{ vars.JANUS_RUNTIME_MI_CLIENT_ID }}" \
+              managedIdentityResourceId="${{ vars.JANUS_RUNTIME_MI_RESOURCE_ID }}" \
+              keycloakAdminPassword="$KEYCLOAK_ADMIN_PASSWORD" \
+              postgresAdministratorPassword="$KEYCLOAK_POSTGRES_PASSWORD" \
+              cleanupRetentionDays="$CLEANUP_RETENTION_DAYS" \
+              cleanupDryRun="$CLEANUP_DRY_RUN" \
+              externalIngressEnabled="$EXTERNAL_INGRESS_ENABLED" \
+              allowedRedirectPatterns="$ALLOWED_REDIRECT_PATTERNS" \
+              useExistingNetwork="$use_existing_network" \
+              existingContainerAppsSubnetId="$EXISTING_CONTAINER_APPS_SUBNET_ID" \
+              existingPostgresSubnetId="$EXISTING_POSTGRES_SUBNET_ID" \
+              existingPostgresPrivateDnsZoneId="$EXISTING_POSTGRES_PRIVATE_DNS_ZONE_ID" \
+            --query properties.outputs --output json --only-show-errors)
+
+          dcr_endpoint=$(jq -r '.dcrEndpoint.value' <<<"$outputs")
+          app_fqdn=$(jq -r '.janusFqdn.value' <<<"$outputs")
+          [[ "$dcr_endpoint" == https://* ]] || { echo 'Deployment did not return a valid DCR endpoint' >&2; exit 1; }
+          echo "dcr_endpoint=$dcr_endpoint" >> "$GITHUB_OUTPUT"
+          echo "app_fqdn=$app_fqdn" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test deployed revision
+        shell: bash
+        env:
+          EXTERNAL_INGRESS_ENABLED: ${{ vars.JANUS_EXTERNAL_INGRESS_ENABLED || 'false' }}
+          APP_FQDN: ${{ steps.deploy.outputs.app_fqdn }}
+        run: |
+          set -euo pipefail
+          app_name="janus-${{ vars.JANUS_ENVIRONMENT_NAME }}-app"
+          revision=$(az containerapp revision list \
+            --name "$app_name" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --query '[?properties.active].{name:name,health:properties.healthState}[0]' \
+            --output json --only-show-errors)
+          [[ "$(jq -r '.health' <<<"$revision")" == 'Healthy' ]] || { echo "Active revision is not healthy: $revision" >&2; exit 1; }
+
+          if [[ "$EXTERNAL_INGRESS_ENABLED" == 'true' ]]; then
+            for attempt in {1..12}; do
+              if curl --fail --silent --show-error --max-time 10 \
+                "https://$APP_FQDN/realms/janus/.well-known/openid-configuration" >/dev/null; then
+                status=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 \
+                  --request POST "https://$APP_FQDN/realms/janus/clients-registrations/openid-connect" \
+                  --header 'Content-Type: application/json' --data '{}')
+                [[ "$status" == '401' ]] || { echo "DCR admission smoke test returned HTTP $status, expected 401" >&2; exit 1; }
+                exit 0
+              fi
+              sleep 10
+            done
+            echo 'External readiness smoke test failed.' >&2
+            exit 1
+          fi
+          echo 'External ingress is disabled; Azure revision health passed and public HTTP smoke test was skipped.'
+
+      - name: Deployment summary
+        shell: bash
+        run: |
+          {
+            echo '### JANUS deployment'
+            echo
+            echo "- Image: \`${{ needs.build-image.outputs.image-reference }}\`"
+            echo "- DCR endpoint: \`${{ steps.deploy.outputs.dcr_endpoint }}\`"
+            echo "- Cleanup dry-run: \`${{ vars.JANUS_CLEANUP_DRY_RUN || 'true' }}\`"
+            echo "- Public ingress: \`${{ vars.JANUS_EXTERNAL_INGRESS_ENABLED || 'false' }}\`"
+            echo '- Gateway access tokens remain Microsoft Entra-issued and never transit JANUS.'
+          } >> "$GITHUB_STEP_SUMMARY"
