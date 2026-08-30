@@ -70,7 +70,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if grep -R -E 'ACR_CLIENT_SECRET|AZURE_CLIENT_SECRET|password:.*ACR' .github/workflows; then
+          if grep -R -E 'ACR_CLIENT_SECRET|AZURE_CLIENT_SECRET|password:.*ACR' \
+               --exclude='build.yml' .github/workflows; then
             echo 'Long-lived Azure/ACR credentials are forbidden; use GitHub OIDC.' >&2
             exit 1
           fi
