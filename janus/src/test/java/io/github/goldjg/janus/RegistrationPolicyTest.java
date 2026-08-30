@@ -22,7 +22,7 @@ class RegistrationPolicyTest {
 
     @BeforeEach
     void setUp() {
-        policy = new RegistrationPolicy(JanusConfig.fromEnvironment());
+        policy = new RegistrationPolicy(JanusConfig.forTesting());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -263,6 +263,7 @@ class RegistrationPolicyTest {
         DcrRequest request = new DcrRequest();
         request.setClientName("Claude Code");
         request.setRedirectUris(List.of("http://localhost:8080/callback"));
+        request.setScope("api://11111111-1111-4111-8111-111111111111/Mcp.Access");
         assertDoesNotThrow(() -> policy.validate(request));
     }
 
@@ -274,6 +275,40 @@ class RegistrationPolicyTest {
         request.setGrantTypes(List.of("authorization_code"));
         request.setResponseTypes(List.of("code"));
         request.setTokenEndpointAuthMethod("none");
+        request.setScope("api://11111111-1111-4111-8111-111111111111/Mcp.Access");
         assertDoesNotThrow(() -> policy.validate(request));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "http://localhost.evil.example:8080/callback",
+            "http://localhost@evil.example:8080/callback",
+            "http://127.0.0.2:8080/callback",
+            "http://localhost/callback",
+            "http://localhost:8080/*",
+            "https://localhost:8080/callback",
+            "http://localhost:8080/callback?next=https://evil.example"
+    })
+    void validate_rejectsLoopbackLookalikesAndUnapprovedVariants(String redirectUri) {
+        assertThrows(RegistrationPolicyViolationException.class,
+                () -> policy.validateRedirectUris(List.of(redirectUri)));
+    }
+
+    @Test
+    void validate_rejectsMissingScope() {
+        assertThrows(RegistrationPolicyViolationException.class, () -> policy.validateScope(null));
+    }
+
+    @Test
+    void validate_rejectsUnapprovedScope() {
+        assertThrows(RegistrationPolicyViolationException.class,
+                () -> policy.validateScope("api://11111111-1111-4111-8111-111111111111/Admin.All"));
+    }
+
+    @Test
+    void validate_rejectsDuplicateScopes() {
+        String scope = "api://11111111-1111-4111-8111-111111111111/Mcp.Access";
+        assertThrows(RegistrationPolicyViolationException.class,
+                () -> policy.validateScope(scope + " " + scope));
     }
 }

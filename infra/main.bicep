@@ -1,220 +1,271 @@
-// JANUS Infrastructure — main.bicep
-// Deploys the complete JANUS MCP Client Registration Broker on Azure Container Apps.
+targetScope = 'resourceGroup'
 
-@description('Location for all resources.')
+@description('Azure region for all JANUS resources.')
 param location string = resourceGroup().location
 
-@description('Base name prefix used for all resources (e.g. "janus-prod").')
+@description('Short, lowercase environment name used in resource names.')
 @minLength(3)
 @maxLength(20)
-param baseName string
+param environmentName string
 
-@description('Entra tenant ID.')
+@description('Permitted Microsoft Entra tenant ID.')
 param tenantId string
 
-@description('App ID URI of the MCP gateway Entra application (e.g. api://<client-id>).')
+@description('MCP gateway Entra application client ID.')
+param gatewayApplicationClientId string
+
+@description('MCP gateway Application ID URI, for example api://<client-id>.')
 param gatewayResourceUri string
 
-@description('Azure Container Registry name (must already exist).')
+@description('Comma-separated scope-uri=permission-uuid mappings JANUS may place on generated clients.')
+param allowedGatewayScopesCsv string
+
+@description('Existing Azure Container Registry name. Bootstrap creates it before the workflow builds an image.')
 param acrName string
 
-@description('Container image tag to deploy.')
-param imageTag string
+@description('Immutable JANUS image reference. Production deployment should use an ACR digest reference.')
+param containerImage string
 
-@description('Keycloak admin username. Should be stored in Key Vault; use a reference.')
-@secure()
-param keycloakAdminPassword string
-
-@description('Client ID of the user-assigned managed identity (created by bootstrap script).')
+@description('Existing JANUS runtime user-assigned managed identity client ID.')
 param managedIdentityClientId string
 
-@description('Resource ID of the user-assigned managed identity.')
+@description('Existing JANUS runtime user-assigned managed identity resource ID.')
 param managedIdentityResourceId string
 
-@description('Comma-separated allowed redirect URI patterns. Defaults to loopback patterns.')
-param allowedRedirectPatterns string = 'http://localhost:,http://127.0.0.1:,http://[::1]:'
+@secure()
+@description('Keycloak bootstrap administrator password. Supply through a protected GitHub Environment secret.')
+param keycloakAdminPassword string
+
+@secure()
+@description('PostgreSQL administrator password. Supply through a protected GitHub Environment secret.')
+param postgresAdministratorPassword string
+
+@description('Keycloak bootstrap administrator username.')
+param keycloakAdminUsername string = 'janus-bootstrap-admin'
+
+@description('PostgreSQL administrator username.')
+param postgresAdministratorLogin string = 'janusadmin'
+
+@description('PostgreSQL SKU name.')
+param postgresSkuName string = 'Standard_B1ms'
+
+@description('PostgreSQL SKU tier.')
+@allowed([
+  'Burstable'
+  'GeneralPurpose'
+  'MemoryOptimized'
+])
+param postgresSkuTier string = 'Burstable'
+
+@description('Enable PostgreSQL high availability. Select a compatible General Purpose or Memory Optimized SKU.')
+param postgresHighAvailability bool = false
+
+@description('Use existing delegated subnet and private DNS resources.')
+param useExistingNetwork bool = false
+
+@description('Existing Container Apps infrastructure subnet resource ID when useExistingNetwork is true.')
+param existingContainerAppsSubnetId string = ''
+
+@description('Existing PostgreSQL delegated subnet resource ID when useExistingNetwork is true.')
+param existingPostgresSubnetId string = ''
+
+@description('Existing PostgreSQL private DNS zone resource ID when useExistingNetwork is true.')
+param existingPostgresPrivateDnsZoneId string = ''
+
+@description('Expose JANUS using public Container Apps ingress. Defaults false; enable only with admission controls and edge abuse protection.')
+param externalIngressEnabled bool = false
+
+@description('Optional CIDRs permitted by Container Apps ingress.')
+param allowedIngressCidrs array = []
+
+@description('Comma-separated redirect URI policy entries. Keep compatibility exceptions explicit.')
+param allowedRedirectPatterns string = 'http://localhost:{port}/*,http://127.0.0.1:{port}/*,http://[::1]:{port}/*'
 
 @description('Maximum redirect URIs per registration.')
+@minValue(1)
+@maxValue(20)
 param maxRedirectUris int = 10
 
-@description('Log Analytics workspace name.')
-param logAnalyticsWorkspaceName string = '${baseName}-law'
+@description('Maximum DCR request bytes.')
+@minValue(1024)
+@maxValue(65536)
+param maxRequestBodyBytes int = 16384
 
-// ─── Log Analytics Workspace ─────────────────────────────────────────────────
-resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
-  name: logAnalyticsWorkspaceName
-  location: location
-  properties: {
-    sku: {
-      name: 'PerGB2018'
-    }
+@description('Maximum client-name length.')
+@minValue(1)
+param maxClientNameLength int = 64
+
+@description('Maximum metadata field length.')
+@minValue(1)
+param maxFieldLength int = 512
+
+@description('Per-source registrations allowed per minute in a replica.')
+@minValue(1)
+param sourceRatePerMinute int = 5
+
+@description('Global registrations allowed per minute in a replica.')
+@minValue(1)
+param globalRatePerMinute int = 25
+
+@description('Maximum successful registrations per process lifetime.')
+@minValue(1)
+param maxRegistrationsPerProcess int = 1000
+
+@description('Idempotency result lifetime in seconds.')
+@minValue(1)
+param idempotencyTtlSeconds int = 600
+
+@description('Cleanup schedule in five-field UTC cron syntax.')
+param cleanupCronExpression string = '0 2 * * *'
+
+@description('Cleanup retention in days.')
+@minValue(1)
+param cleanupRetentionDays int = 30
+
+@description('Keep cleanup non-destructive until lifecycle evidence and logs have been reviewed.')
+param cleanupDryRun bool = true
+
+@description('Maximum number of applications deleted by one cleanup run.')
+@minValue(1)
+param cleanupMaxDeletesPerRun int = 20
+
+@description('Enable zone redundancy for the Container Apps environment where supported.')
+param containerEnvironmentZoneRedundant bool = false
+
+@description('Resource tags added to all resources created by this deployment.')
+param tags object = {
+  application: 'janus'
+  managedBy: 'bicep'
+  dataPlaneIssuer: 'microsoft-entra-id'
+}
+
+var baseName = 'janus-${environmentName}'
+var postgresServerName = take('${replace(baseName, '-', '')}${uniqueString(subscription().id, resourceGroup().id)}', 63)
+
+module observability './modules/observability.bicep' = {
+  name: 'observability'
+  params: {
+    location: location
+    workspaceName: '${baseName}-law'
     retentionInDays: 30
+    tags: tags
   }
 }
 
-// ─── Container Apps Environment ───────────────────────────────────────────────
-resource caEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
-  name: '${baseName}-env'
-  location: location
-  properties: {
-    appLogsConfiguration: {
-      destination: 'log-analytics'
-      logAnalyticsConfiguration: {
-        customerId: logAnalytics.properties.customerId
-        sharedKey: logAnalytics.listKeys().primarySharedKey
-      }
-    }
+module network './modules/network.bicep' = {
+  name: 'network'
+  params: {
+    location: location
+    baseName: baseName
+    useExistingNetwork: useExistingNetwork
+    existingContainerAppsSubnetId: existingContainerAppsSubnetId
+    existingPostgresSubnetId: existingPostgresSubnetId
+    existingPostgresPrivateDnsZoneId: existingPostgresPrivateDnsZoneId
+    tags: tags
   }
 }
 
-// ─── Keycloak Container App ───────────────────────────────────────────────────
-resource keycloakApp 'Microsoft.App/containerApps@2024-03-01' = {
-  name: '${baseName}-keycloak'
-  location: location
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${managedIdentityResourceId}': {}
-    }
-  }
-  properties: {
-    environmentId: caEnv.id
-    configuration: {
-      ingress: {
-        external: true
-        targetPort: 8080
-        transport: 'http'
-        allowInsecure: false
-      }
-      secrets: [
-        {
-          name: 'keycloak-admin-password'
-          value: keycloakAdminPassword
-        }
-      ]
-      registries: [
-        {
-          server: '${acrName}.azurecr.io'
-          identity: managedIdentityResourceId
-        }
-      ]
-    }
-    template: {
-      containers: [
-        {
-          name: 'keycloak'
-          image: '${acrName}.azurecr.io/janus-keycloak:${imageTag}'
-          resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
-          }
-          env: [
-            { name: 'KEYCLOAK_ADMIN', value: 'admin' }
-            { name: 'KEYCLOAK_ADMIN_PASSWORD', secretRef: 'keycloak-admin-password' }
-            { name: 'KC_PROXY', value: 'edge' }
-            { name: 'KC_HTTP_ENABLED', value: 'true' }
-            { name: 'KC_HOSTNAME_STRICT', value: 'false' }
-            { name: 'JANUS_TENANT_ID', value: tenantId }
-            { name: 'JANUS_GATEWAY_RESOURCE_URI', value: gatewayResourceUri }
-            { name: 'JANUS_ALLOWED_REDIRECT_URI_PATTERNS', value: allowedRedirectPatterns }
-            { name: 'JANUS_MAX_REDIRECT_URIS', value: string(maxRedirectUris) }
-            { name: 'AZURE_CLIENT_ID', value: managedIdentityClientId }
-          ]
-          probes: [
-            {
-              type: 'Readiness'
-              httpGet: {
-                path: '/realms/master'
-                port: 8080
-              }
-              initialDelaySeconds: 30
-              periodSeconds: 10
-              failureThreshold: 6
-            }
-            {
-              type: 'Liveness'
-              httpGet: {
-                path: '/realms/master'
-                port: 8080
-              }
-              initialDelaySeconds: 60
-              periodSeconds: 30
-              failureThreshold: 3
-            }
-          ]
-        }
-      ]
-      scale: {
-        minReplicas: 1
-        maxReplicas: 3
-        rules: [
-          {
-            name: 'http-scaling'
-            http: {
-              metadata: {
-                concurrentRequests: '20'
-              }
-            }
-          }
-        ]
-      }
-    }
+module containerEnvironment './modules/container-environment.bicep' = {
+  name: 'container-environment'
+  params: {
+    location: location
+    environmentName: '${baseName}-cae'
+    infrastructureSubnetId: network.outputs.containerAppsSubnetId
+    logAnalyticsWorkspaceName: observability.outputs.workspaceName
+    zoneRedundant: containerEnvironmentZoneRedundant
+    tags: tags
   }
 }
 
-// ─── Cleanup Container Apps Job ───────────────────────────────────────────────
-resource cleanupJob 'Microsoft.App/jobs@2024-03-01' = {
-  name: '${baseName}-cleanup'
-  location: location
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${managedIdentityResourceId}': {}
-    }
-  }
-  properties: {
-    environmentId: caEnv.id
-    configuration: {
-      triggerType: 'Schedule'
-      replicaTimeout: 300
-      replicaRetryLimit: 1
-      scheduleTriggerConfig: {
-        // Daily at 02:00 UTC
-        cronExpression: '0 2 * * *'
-        parallelism: 1
-        replicaCompletionCount: 1
-      }
-      registries: [
-        {
-          server: '${acrName}.azurecr.io'
-          identity: managedIdentityResourceId
-        }
-      ]
-    }
-    template: {
-      containers: [
-        {
-          name: 'cleanup'
-          image: '${acrName}.azurecr.io/janus-keycloak:${imageTag}'
-          resources: {
-            cpu: json('0.25')
-            memory: '0.5Gi'
-          }
-          // Override the Keycloak entrypoint to run the cleanup job
-          command: ['/opt/janus/cleanup.sh']
-          env: [
-            { name: 'JANUS_TENANT_ID', value: tenantId }
-            { name: 'JANUS_REALM', value: 'janus' }
-            { name: 'AZURE_CLIENT_ID', value: managedIdentityClientId }
-          ]
-        }
-      ]
-    }
+module database './modules/database.bicep' = {
+  name: 'keycloak-database'
+  params: {
+    location: location
+    serverName: postgresServerName
+    databaseName: 'keycloak'
+    administratorLogin: postgresAdministratorLogin
+    administratorPassword: postgresAdministratorPassword
+    delegatedSubnetId: network.outputs.postgresSubnetId
+    privateDnsZoneId: network.outputs.postgresPrivateDnsZoneId
+    skuName: postgresSkuName
+    skuTier: postgresSkuTier
+    highAvailability: postgresHighAvailability
+    backupRetentionDays: 7
+    tags: tags
   }
 }
 
-// ─── Outputs ──────────────────────────────────────────────────────────────────
-output keycloakFqdn string = keycloakApp.properties.configuration.ingress.fqdn
-output keycloakAppId string = keycloakApp.id
-output cleanupJobId string = cleanupJob.id
-output dcrEndpoint string = 'https://${keycloakApp.properties.configuration.ingress.fqdn}/realms/janus/clients-registrations/openid-connect'
+module registry './modules/registry.bicep' = {
+  name: 'registry-diagnostics'
+  params: {
+    registryName: acrName
+    logAnalyticsWorkspaceId: observability.outputs.workspaceId
+  }
+}
+
+module janusApp './modules/container-app.bicep' = {
+  name: 'janus-app'
+  params: {
+    location: location
+    appName: '${baseName}-app'
+    environmentId: containerEnvironment.outputs.environmentId
+    environmentDefaultDomain: containerEnvironment.outputs.defaultDomain
+    containerImage: containerImage
+    registryLoginServer: registry.outputs.loginServer
+    managedIdentityResourceId: managedIdentityResourceId
+    managedIdentityClientId: managedIdentityClientId
+    tenantId: tenantId
+    gatewayApplicationClientId: gatewayApplicationClientId
+    gatewayResourceUri: gatewayResourceUri
+    allowedGatewayScopesCsv: allowedGatewayScopesCsv
+    allowedRedirectPatterns: allowedRedirectPatterns
+    maxRedirectUris: maxRedirectUris
+    maxRequestBodyBytes: maxRequestBodyBytes
+    maxClientNameLength: maxClientNameLength
+    maxFieldLength: maxFieldLength
+    sourceRatePerMinute: sourceRatePerMinute
+    globalRatePerMinute: globalRatePerMinute
+    maxRegistrationsPerProcess: maxRegistrationsPerProcess
+    idempotencyTtlSeconds: idempotencyTtlSeconds
+    databaseServerFqdn: database.outputs.serverFqdn
+    databaseName: database.outputs.databaseName
+    databaseUsername: postgresAdministratorLogin
+    databasePassword: postgresAdministratorPassword
+    keycloakAdminUsername: keycloakAdminUsername
+    keycloakAdminPassword: keycloakAdminPassword
+    externalIngressEnabled: externalIngressEnabled
+    allowedIngressCidrs: allowedIngressCidrs
+    minReplicas: 1
+    // Per-process creation/idempotency controls are intentionally not treated
+    // as distributed controls. Raise only after adding reviewed edge admission.
+    maxReplicas: 1
+    tags: tags
+  }
+}
+
+module cleanupJob './modules/cleanup-job.bicep' = {
+  name: 'cleanup-job'
+  params: {
+    location: location
+    jobName: '${baseName}-cleanup'
+    environmentId: containerEnvironment.outputs.environmentId
+    containerImage: containerImage
+    registryLoginServer: registry.outputs.loginServer
+    managedIdentityResourceId: managedIdentityResourceId
+    managedIdentityClientId: managedIdentityClientId
+    tenantId: tenantId
+    cronExpression: cleanupCronExpression
+    retentionDays: cleanupRetentionDays
+    dryRun: cleanupDryRun
+    maxDeletesPerRun: cleanupMaxDeletesPerRun
+    tags: tags
+  }
+}
+
+output janusContainerAppId string = janusApp.outputs.appId
+output janusFqdn string = janusApp.outputs.appFqdn
+output dcrEndpoint string = janusApp.outputs.dcrEndpoint
+output cleanupJobId string = cleanupJob.outputs.jobId
+output runtimeManagedIdentityResourceId string = managedIdentityResourceId
+output logAnalyticsWorkspaceId string = observability.outputs.workspaceId
+output postgresServerId string = database.outputs.serverId

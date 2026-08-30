@@ -1,68 +1,96 @@
-# JANUS Client Identity Metadata Descriptor (CIMD) Roadmap
+# CIMD migration roadmap
 
-## Status: Exploratory
+## Status
 
-This document describes a planned extension to JANUS that would allow MCP clients to declare richer identity metadata at registration time. The CIMD capability is not implemented in the initial release.
+The MCP 2026-07-28 specification formally deprecated Dynamic Client
+Registration in favour of Client ID Metadata Documents (CIMD). DCR remains a
+backward-compatibility mechanism for now and is expected to be removed in a
+future specification version.
 
-## Problem
+JANUS therefore remains useful to existing DCR clients, but new architecture
+must not bind Entra provisioning or lifecycle behavior to RFC 7591 objects.
 
-The initial JANUS release creates Entra app registrations with minimal metadata: display name, redirect URIs, and JANUS ownership tags. MCP clients and gateway operators may benefit from richer, structured metadata that describes:
+Primary reference: [MCP 2026-07-28 release](https://blog.modelcontextprotocol.io/posts/2026-07-28/).
 
-- The purpose of the MCP client
-- The user or organisation responsible for the client
-- The expected usage patterns
-- Version and lifecycle metadata
+## Architecture direction
 
-## Proposed approach
-
-CIMD would extend the DCR request with a `janus_client_metadata` extension field:
-
-```json
-{
-  "client_name": "Claude Code",
-  "redirect_uris": ["http://localhost:8080/callback"],
-  "janus_client_metadata": {
-    "client_description": "Local MCP client for Claude Code IDE extension",
-    "client_owner": "developer@example.com",
-    "client_version": "1.2.0",
-    "client_environment": "development"
-  }
-}
+```text
+legacy MCP client --> DCR adapter ----+
+                                      |
+future MCP client --> CIMD adapter ---+--> admission + normalized registration
+                                             |
+                                             v
+                                      provisioning core
+                                             |
+                                             v
+                                      Microsoft Entra ID
 ```
 
-JANUS would validate the `janus_client_metadata` fields, sanitise them, and include relevant fields in the Entra app registration `notes` field and/or custom extension attributes.
+Protocol adapters are responsible for parsing, protocol errors and response
+shape. Shared policy is responsible for tenant, redirect, gateway scope,
+public-client, admission and creation-limit decisions. The provisioning core
+accepts only normalized approved values and does not know whether they came
+from DCR or CIMD.
 
-## Constraints
+## What remains shared
 
-- CIMD metadata is stored in Entra, not in a JANUS database. JANUS remains stateless.
-- Metadata is descriptive only; it does not affect gateway authorisation.
-- No PII (email addresses, user identifiers) in CIMD metadata unless explicitly configured and documented.
-- CIMD fields are bounded (maximum field length, maximum field count).
-- CIMD is an extension field; its presence is optional. Requests without it are accepted normally.
+- Entra tenant and gateway-resource binding;
+- redirect URI and public-client policy;
+- approved gateway scope mapping;
+- admission, idempotency and bounded creation controls;
+- deterministic operational metadata and collision-resistant naming;
+- managed-identity Graph transport;
+- positive ownership/lifecycle markers;
+- conservative cleanup and observability;
+- the rule that registration does not grant gateway authorization.
 
-## Entra storage
+## Migration phases
 
-Candidate Entra fields for CIMD metadata:
+### 1. DCR compatibility baseline
 
-| Field | Entra property | Limit |
-|---|---|---|
-| Description | `notes` | 1024 characters |
-| Tags | `tags` array | 256 characters per tag |
-| Custom attributes | Extension attributes (requires schema extension) | Complex |
+- Prove selected legacy MCP clients can register and then use the configured
+  Entra issuer directly.
+- Keep DCR in a narrow adapter.
+- Record issuer-binding behavior per client; never silently reuse a client ID
+  with another authorization server.
 
-The initial CIMD implementation would use `notes` and `tags` only to avoid schema extension complexity.
+### 2. CIMD discovery and compatibility research
 
-## Timeline
+- Track the normative MCP authorization text and supported SDK/client releases.
+- Test how CIMD client identifiers are represented and bound to the Entra issuer.
+- Determine whether an Entra registration must be pre-provisioned, cached or
+  mapped, without inventing unsupported metadata semantics.
+- Threat-model document hosting, origin binding, cache behavior and metadata
+  substitution.
 
-CIMD is not planned for the initial release. It will be considered once:
+### 3. Optional CIMD adapter
 
-1. The base JANUS implementation is stable and validated in production.
-2. There is demonstrated demand from MCP client operators.
-3. The Entra metadata storage approach is validated against production tenant limits.
+Implement only after at least one target client and the relevant specification
+are stable enough for contract tests. The adapter must feed the existing
+normalized provisioning interface and must not broaden Graph permissions or
+move JANUS into token issuance.
 
-## Non-goals for CIMD
+### 4. DCR retirement
 
-- CIMD must not affect Entra authorisation policies
-- CIMD must not include credential material, tokens, or secrets
-- CIMD must not exceed Entra API field limits in a way that causes registration failures
-- CIMD must not require a JANUS database or persistent store
+- Measure actual DCR use without logging client secrets or tokens.
+- Publish a deprecation window aligned with the MCP policy.
+- Disable new DCR registration before removing lifecycle support for existing
+  Entra applications.
+- Preserve explicit operator control over existing registrations.
+
+## Explicit non-goals
+
+- no speculative CIMD endpoint in the initial release;
+- no generic client metadata hosting service;
+- no JWT/software-statement feature merely to mimic a future standard;
+- no token exchange, issuer impersonation or Keycloak gateway-token issuance;
+- no automatic migration that changes a client ID or gateway authorization.
+
+## Exit criteria for a CIMD implementation
+
+- normative behavior and issuer binding are understood;
+- at least one real MCP client is covered by opt-in end-to-end tests;
+- metadata substitution and origin threats are addressed;
+- Entra object lifecycle and idempotency behavior are defined;
+- DCR and CIMD adapters produce equivalent normalized policy inputs;
+- documentation clearly distinguishes registration from authorization.

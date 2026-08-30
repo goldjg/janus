@@ -108,4 +108,21 @@ class GraphClientServiceTest {
         String tag = GraphClientService.TAG_REALM_PREFIX + "myrealm";
         assertEquals("janus-realm:myrealm", tag);
     }
+
+    @Test
+    void containerAppsIdentityUri_requiresLocalSidecarAndUserAssignedClientId() {
+        String clientId = "11111111-1111-4111-8111-111111111111";
+        var uri = GraphClientService.containerAppsIdentityUri(
+                "http://localhost:42356/msi/token", clientId);
+        assertEquals("localhost", uri.getHost());
+        assertTrue(uri.getRawQuery().contains("api-version=2019-08-01"));
+        assertTrue(uri.getRawQuery().contains("client_id=" + clientId));
+
+        assertThrows(JanusRegistrationException.class, () ->
+                GraphClientService.containerAppsIdentityUri(
+                        "https://attacker.example/token", clientId));
+        assertThrows(IllegalArgumentException.class, () ->
+                GraphClientService.containerAppsIdentityUri(
+                        "http://localhost:42356/msi/token", "not-a-uuid"));
+    }
 }

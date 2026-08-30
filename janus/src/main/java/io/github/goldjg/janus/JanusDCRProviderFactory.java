@@ -20,6 +20,9 @@ import org.keycloak.services.clientregistration.ClientRegistrationProviderFactor
  */
 public class JanusDCRProviderFactory implements ClientRegistrationProviderFactory {
 
+    private static final InMemoryRegistrationControl REGISTRATION_CONTROL =
+            new InMemoryRegistrationControl();
+
     /**
      * SPI provider ID.
      *
@@ -61,5 +64,9 @@ public class JanusDCRProviderFactory implements ClientRegistrationProviderFactor
     @Override
     public int order() {
         return 100;
+    }
+
+    static InMemoryRegistrationControl registrationControl() {
+        return REGISTRATION_CONTROL;
     }
 }

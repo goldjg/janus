@@ -64,3 +64,28 @@ invariants:
     name: Repository truth over session memory
     rule: Current repository state and canonical cARL artefacts must outrank stale prompt or session memory when they conflict.
     severity: high
+
+  - id: janus-registration-plane-only
+    name: JANUS remains registration-plane only
+    rule: No JANUS component may issue, proxy, cache, exchange, re-sign, or store a bearer token used to access the protected MCP gateway; Microsoft Entra ID remains the issuer.
+    severity: critical
+
+  - id: janus-registration-not-authorization
+    name: Registration never grants gateway admission
+    rule: Creating a JANUS-managed client identity must not assign users or groups, grant consent, or otherwise confer authorization to the MCP gateway.
+    severity: critical
+
+  - id: janus-hostile-dcr
+    name: DCR is hostile input
+    rule: Externally reachable registration must fail closed on tenant, scope, redirect, metadata, admission, and bounded-creation policy.
+    severity: critical
+
+  - id: janus-conservative-cleanup
+    name: Cleanup retains on uncertainty
+    rule: Lifecycle cleanup must be dry-run-first, require positive JANUS ownership markers, distinguish creation from use evidence, and retain applications when activity evidence is missing or ambiguous.
+    severity: critical
+
+  - id: janus-federated-deployment
+    name: Federated deployment identity
+    rule: GitHub Actions must use OIDC workload identity federation for Azure deployment and must not use a long-lived Azure client secret.
+    severity: high

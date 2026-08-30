@@ -1,0 +1,13 @@
+vulnerabilities:
+  - id: CVE-2025-59250
+    paths:
+      - "opt/keycloak/lib/lib/main/com.microsoft.sqlserver.mssql-jdbc-13.2.1.jre11.jar"
+    purls:
+      - "pkg:maven/com.microsoft.sqlserver/mssql-jdbc@13.2.1"
+    expired_at: 2026-11-30
+    statement: >-
+      Keycloak 26.7.2 contains mssql-jdbc 13.2.1.jre11, the Microsoft release
+      that fixes CVE-2025-59250. Trivy normalizes its embedded Maven version to
+      13.2.1 while comparing it to the classifier-qualified fixed version
+      13.2.1.jre11, producing a false positive. Revalidate on Keycloak, Trivy,
+      or vulnerability-database updates and before this exception expires.

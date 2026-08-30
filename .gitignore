@@ -83,6 +83,7 @@ Thumbs.db
 # --- Azure / IaC -----------------------------------------------------------
 .azure/
 *.bicepparam.local
+infra/parameters.bicepparam
 main.json
 *.tfstate
 *.tfstate.*
