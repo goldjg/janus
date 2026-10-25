@@ -32,7 +32,7 @@
         <keycloak.version>26.7.2</keycloak.version>
 
         <!-- Jackson is available in Keycloak and bundled into cleanup classifier. -->
-        <jackson.version>2.21.5</jackson.version>
+        <jackson.version>2.21.7</jackson.version>
         <!-- jackson-annotations uses a major.minor release cadence. -->
         <jackson.annotations.version>2.21</jackson.annotations.version>
 
